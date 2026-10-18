@@ -27,8 +27,58 @@ const PING_MS = 25000;   // keeps idle connections open behind proxies (Render c
 
 const rooms = new Map();   // code -> {code, host, guests: Map(id -> ws), max, refuse, nextId}
 
-const server = http.createServer((req, res) => {   // health check for the hosting platform
-  res.writeHead(200, { "Content-Type": "text/plain" });
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function json(res, status, obj) {
+  res.writeHead(status, { "Content-Type": "application/json", ...CORS });
+  res.end(JSON.stringify(obj));
+}
+
+// HTTP side: health check, the public lobby list, and the host's public/private switch.
+//   GET  /rooms          -> [{code, name, players, max}] for rooms that are public, open and not full
+//   POST /rooms/public   -> {code, token, on, name}. The first call for a room claims it with `token`
+//                           (the host does this as soon as the room exists); after that only the same token can change it.
+const server = http.createServer((req, res) => {
+  const url = (req.url || "").split("?")[0];
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS);
+    return res.end();
+  }
+  if (req.method === "GET" && url === "/rooms") {
+    const list = [];
+    for (const room of rooms.values()) {
+      if (!room.isPublic || room.refuse || room.guests.size + 1 >= room.max) continue;
+      list.push({ code: room.code, name: room.hostName, players: room.guests.size + 1, max: room.max });
+    }
+    return json(res, 200, list);
+  }
+  if (req.method === "POST" && url === "/rooms/public") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 2048) req.destroy();
+    });
+    req.on("end", () => {
+      let msg;
+      try { msg = JSON.parse(body); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      const code = typeof msg.code === "string" ? msg.code.trim().toUpperCase() : "";
+      const token = typeof msg.token === "string" ? msg.token : "";
+      const room = rooms.get(code);
+      if (!room || token.length < 8 || token.length > 64) return json(res, 404, { error: "no such room" });
+      if (room.token === null) room.token = token;
+      else if (room.token !== token) return json(res, 403, { error: "not the host" });
+      room.isPublic = !!msg.on;
+      if (typeof msg.name === "string") room.hostName = msg.name.trim().slice(0, 14) || "Host";
+      console.log(`room ${code} is now ${room.isPublic ? "public" : "private"}`);
+      return json(res, 200, { ok: true, public: room.isPublic });
+    });
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "text/plain", ...CORS });   // health check for the hosting platform
   res.end("ok");
 });
 const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
@@ -62,7 +112,7 @@ function hostRoom(ws, msg) {
     code = newCode();
     if (!code) return fail(ws, "No room codes are free right now.");
   }
-  const room = { code, host: ws, guests: new Map(), max, refuse: false, nextId: 2 };
+  const room = { code, host: ws, guests: new Map(), max, refuse: false, nextId: 2, isPublic: false, token: null, hostName: "Host" };
   rooms.set(code, room);
   ws.room = room;
   ws.role = "host";
