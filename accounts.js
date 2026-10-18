@@ -10,18 +10,15 @@
 //
 // Errors are {error: "text"} with a 4xx status.
 //
-// Storage: one JSON file at DATA_DIR/accounts.json (default ./data). On Render's free tier the disk is wiped on
-// every restart/deploy, so set DATA_DIR to a mounted persistent disk (e.g. /var/data) or accounts will vanish.
+// Storage: a Turso (libSQL) database, one row per account in the "users" table. Set TURSO_DATABASE_URL and
+// TURSO_AUTH_TOKEN. Accounts are loaded into memory at startup and changed rows are written back shortly after.
+// Nothing is stored on the server's disk, so Render restarts/deploys no longer wipe accounts.
 
 "use strict";
 const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
 const { promisify } = require("util");
+const { createClient } = require("@libsql/client");
 const scrypt = promisify(crypto.scrypt);
-
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "accounts.json");
 
 const USER_RE = /^[A-Za-z0-9_]{3,16}$/;
 const FILE_RE = /^[A-Za-z0-9_][A-Za-z0-9_.\- ]{0,63}$/;
@@ -39,24 +36,75 @@ const REGISTER_WINDOW = 60 * 60 * 1000;
 
 // ---------- storage ----------
 
-let db = { users: {} };   // lowercase username -> {name, salt, hash, tokens: [sha256], files: {name: {t, d}}, created}
-try { db = JSON.parse(fs.readFileSync(DB_FILE, "utf8")); } catch (e) { /* first run */ }
-if (!db || typeof db.users !== "object") db = { users: {} };
+const turso = createClient({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
+let db = { users: {} };         // lowercase username -> {name, salt, hash, tokens: [sha256], files: {name: {t, d}}, created}
 const tokenIndex = new Map();   // sha256(token) -> lowercase username
-for (const [key, user] of Object.entries(db.users)) {
-  for (const h of user.tokens || []) tokenIndex.set(h, key);
+const saved = new Map();        // lowercase username -> the JSON last written to Turso (to find what changed)
+
+let ready = null;
+function ensureReady() {
+  if (!ready) ready = init().catch((e) => { ready = null; throw e; });   // retried on the next request if it failed
+  return ready;
 }
 
-function flush() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = DB_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(db));
-    fs.renameSync(tmp, DB_FILE);
-  } catch (e) {
-    console.error("could not write accounts:", e.message);
+async function init() {
+  await turso.execute("CREATE TABLE IF NOT EXISTS users (key TEXT PRIMARY KEY, data TEXT NOT NULL)");
+  const rs = await turso.execute("SELECT key, data FROM users");
+  const users = {};
+  saved.clear();
+  tokenIndex.clear();
+  for (const row of rs.rows) {
+    const key = String(row.key);
+    const data = String(row.data);
+    try {
+      users[key] = JSON.parse(data);
+      saved.set(key, data);
+    } catch (e) {
+      console.error("skipping unreadable account row:", key);
+    }
   }
+  db = { users };
+  for (const [key, user] of Object.entries(db.users)) {
+    for (const h of user.tokens || []) tokenIndex.set(h, key);
+  }
+  console.log(`loaded ${Object.keys(db.users).length} accounts`);
+}
+
+async function doFlush() {
+  const stmts = [];
+  const written = [];
+  const removed = [];
+  for (const [key, user] of Object.entries(db.users)) {
+    const data = JSON.stringify(user);
+    if (saved.get(key) === data) continue;
+    stmts.push({
+      sql: "INSERT INTO users (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data",
+      args: [key, data],
+    });
+    written.push([key, data]);
+  }
+  for (const key of saved.keys()) {
+    if (db.users[key]) continue;
+    stmts.push({ sql: "DELETE FROM users WHERE key = ?", args: [key] });
+    removed.push(key);
+  }
+  if (!stmts.length) return;
+  await turso.batch(stmts, "write");
+  for (const [key, data] of written) saved.set(key, data);
+  for (const key of removed) saved.delete(key);
+}
+
+let chain = Promise.resolve();   // flushes run one at a time
+function flush() {
+  chain = chain.then(doFlush).catch((e) => {
+    console.error("could not write accounts:", e.message);
+    setTimeout(persist, 5000).unref();   // try again; nothing is lost while the server stays up
+  });
+  return chain;
 }
 
 let flushTimer = null;
@@ -64,7 +112,7 @@ function persist() {
   if (flushTimer) return;
   flushTimer = setTimeout(() => { flushTimer = null; flush(); }, 500);
 }
-process.on("SIGTERM", () => { flush(); process.exit(0); });
+process.on("SIGTERM", () => { flush().finally(() => process.exit(0)); });
 
 // ---------- helpers ----------
 
@@ -240,6 +288,10 @@ async function handle(req, res, url, json) {
   let msg;
   try { msg = await readBody(req); } catch (e) { return json(res, 400, { error: "Bad request." }); }
   if (!msg || typeof msg !== "object") return json(res, 400, { error: "Bad request." });
+  try { await ensureReady(); } catch (e) {
+    console.error("could not load accounts:", e.message);
+    return json(res, 503, { error: "Accounts are unavailable right now. Try again in a moment." });
+  }
   try {
     switch (url) {
       case "/account/register": return await register(req, res, msg, json);
