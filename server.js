@@ -17,6 +17,7 @@
 
 const http = require("http");
 const { WebSocketServer } = require("ws");
+const accounts = require("./accounts");   // username/password accounts + cloud saves (POST /account/...)
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no I, O, 0, 1
@@ -47,6 +48,9 @@ const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, CORS);
     return res.end();
+  }
+  if (url.startsWith("/account/")) {
+    return accounts.handle(req, res, url, json);
   }
   if (req.method === "GET" && url === "/rooms") {
     const list = [];
