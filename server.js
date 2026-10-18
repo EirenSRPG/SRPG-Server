@@ -1,192 +1,164 @@
 // Relay server for relay_peer.gd.
-// Star layout: the host is peer id 1, guests get ids 2, 3, ...
-// Guests only talk to the host; the host can send to any guest.
 //
-// Packet format (binary, little-endian), 6-byte header then the payload:
-//   int32 peer id (target when a client sends, sender when a client receives)
-//   byte  transfer mode
-//   byte  channel
-// Text messages are JSON control messages (host, join, refuse, kick / hosted, joined, peer_joined, peer_left, error).
+// Text messages (JSON)
+//   client -> server: {t:"host", max, code?}   open a room (code = reuse this room code if it is free)
+//                     {t:"join", code}          join a room
+//                     {t:"refuse", on}          host only: stop / start accepting new guests
+//                     {t:"kick", id}            host only: remove a guest
+//   server -> client: {t:"hosted", code}        the room exists (code may differ from the one asked for)
+//                     {t:"joined", id}          you are in; id is your multiplayer peer id
+//                     {t:"peer_joined", id}     host only
+//                     {t:"peer_left", id}       host only
+//                     {t:"error", reason}       then the socket is closed
+//
+// Binary messages are game packets: int32 LE (target when sending / sender when receiving), mode byte, channel byte, payload.
+//   guest -> host only (the host's Godot relays guest-to-guest messages)
+//   host  -> target > 0: that guest | 0: every guest | < 0: every guest except abs(target)
 
-const http = require('http');
-const { WebSocketServer } = require('ws');
+const http = require("http");
+const { WebSocketServer } = require("ws");
 
-const PORT = process.env.PORT || 8080;   // Render (and most hosts) tell us which port to use
+const PORT = parseInt(process.env.PORT || "8080", 10);
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no I, O, 0, 1
+const CODE_RE = /^[A-Z0-9]{4,6}$/;
 const HEADER_SIZE = 6;
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';   // no I or O, so codes are easy to read out loud
-const CODE_LENGTH = 4;
+const MAX_ROOM_SIZE = 8;
+const PING_MS = 25000;   // keeps idle connections open behind proxies (Render closes silent ones)
 
-const rooms = new Map();   // code -> { host, guests: Map(id -> ws), max, refuse, nextId }
+const rooms = new Map();   // code -> {code, host, guests: Map(id -> ws), max, refuse, nextId}
 
-// Plain web page so hosting sites can check the server is alive
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Relay server is running.\n');
+const server = http.createServer((req, res) => {   // health check for the hosting platform
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("ok");
 });
+const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
-const wss = new WebSocketServer({ server, maxPayload: 1 << 20 });
-
-function sendJson(ws, obj) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+function send(ws, obj) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
-function makeFrame(from, mode, channel, payload) {
-  const buf = Buffer.alloc(HEADER_SIZE + payload.length);
-  buf.writeInt32LE(from, 0);
-  buf[4] = mode;
-  buf[5] = channel;
-  payload.copy(buf, HEADER_SIZE);
-  return buf;
+function fail(ws, reason) {
+  send(ws, { t: "error", reason });
+  setTimeout(() => ws.close(1000, reason.slice(0, 100)), 50);   // let the error message go out first
 }
 
-function makeCode() {
-  let code;
-  do {
-    code = '';
-    for (let i = 0; i < CODE_LENGTH; i++) {
-      code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
-    }
-  } while (rooms.has(code));
-  return code;
+function newCode() {
+  for (let tries = 0; tries < 1000; tries++) {
+    let code = "";
+    for (let i = 0; i < 4; i++) code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+    if (!rooms.has(code)) return code;
+  }
+  return null;
 }
 
-function sendBinary(ws, buf) {
-  if (ws && ws.readyState === 1) ws.send(buf, { binary: true });
+function hostRoom(ws, msg) {
+  if (ws.room) return;
+  const max = Math.min(Math.max(parseInt(msg.max, 10) || 4, 2), MAX_ROOM_SIZE);
+  let code = typeof msg.code === "string" ? msg.code.trim().toUpperCase() : "";
+  if (code) {
+    if (!CODE_RE.test(code)) return fail(ws, "That room code isn't valid.");
+    if (rooms.has(code)) return fail(ws, "That room code is already in use.");
+  } else {
+    code = newCode();
+    if (!code) return fail(ws, "No room codes are free right now.");
+  }
+  const room = { code, host: ws, guests: new Map(), max, refuse: false, nextId: 2 };
+  rooms.set(code, room);
+  ws.room = room;
+  ws.role = "host";
+  send(ws, { t: "hosted", code });
+  console.log(`room ${code} opened (${rooms.size} rooms)`);
 }
 
-wss.on('connection', (ws) => {
-  ws.isAlive = true;
-  ws.role = null;     // 'host' or 'guest'
-  ws.room = null;
-  ws.peerId = 0;
+function joinRoom(ws, msg) {
+  if (ws.room) return;
+  const code = typeof msg.code === "string" ? msg.code.trim().toUpperCase() : "";
+  const room = rooms.get(code);
+  if (!room) return fail(ws, "Room not found. Check the room code.");
+  if (room.refuse) return fail(ws, "The host isn't accepting new players.");
+  if (room.guests.size + 1 >= room.max) return fail(ws, "That room is full.");
+  const id = room.nextId++;
+  room.guests.set(id, ws);
+  ws.room = room;
+  ws.role = "guest";
+  ws.peerId = id;
+  send(ws, { t: "joined", id });
+  send(room.host, { t: "peer_joined", id });
+}
 
-  ws.on('pong', () => { ws.isAlive = true; });
-
-  ws.on('message', (data, isBinary) => {
-    if (isBinary) {
-      handleData(ws, Buffer.from(data));
-    } else {
-      handleControl(ws, data.toString());
-    }
-  });
-
-  ws.on('close', () => handleClose(ws));
-  ws.on('error', () => {});
-});
-
-function handleControl(ws, text) {
+function onText(ws, text) {
   let msg;
   try { msg = JSON.parse(text); } catch (e) { return; }
-  if (!msg || typeof msg !== 'object') return;
-
+  if (!msg || typeof msg !== "object") return;
   switch (msg.t) {
-    case 'host': {
-      if (ws.role) return;
-      const code = makeCode();
-      const max = Math.min(Math.max(parseInt(msg.max) || 4, 2), 16);
-      const room = { code, host: ws, guests: new Map(), max, refuse: false, nextId: 2 };
-      rooms.set(code, room);
-      ws.role = 'host';
-      ws.room = room;
-      ws.peerId = 1;
-      sendJson(ws, { t: 'hosted', code });
-      console.log(`Room ${code} created (max ${max})`);
-      break;
-    }
-    case 'join': {
-      if (ws.role) return;
-      const code = String(msg.code || '').trim().toUpperCase();
-      const room = rooms.get(code);
-      if (!room) {
-        sendJson(ws, { t: 'error', reason: "That room code doesn't exist. Check it with the host." });
-        ws.close();
-        return;
+    case "host": return hostRoom(ws, msg);
+    case "join": return joinRoom(ws, msg);
+    case "refuse":
+      if (ws.role === "host") ws.room.refuse = !!msg.on;
+      return;
+    case "kick":
+      if (ws.role === "host") {
+        const target = ws.room.guests.get(parseInt(msg.id, 10));
+        if (target) target.close(1000, "You were removed from the lobby.");
       }
-      if (room.refuse) {
-        sendJson(ws, { t: 'error', reason: "The host isn't accepting new players right now." });
-        ws.close();
-        return;
-      }
-      if (room.guests.size + 1 >= room.max) {
-        sendJson(ws, { t: 'error', reason: 'That lobby is full.' });
-        ws.close();
-        return;
-      }
-      const id = room.nextId++;
-      ws.role = 'guest';
-      ws.room = room;
-      ws.peerId = id;
-      room.guests.set(id, ws);
-      sendJson(ws, { t: 'joined', id });
-      sendJson(room.host, { t: 'peer_joined', id });
-      console.log(`Room ${room.code}: guest ${id} joined`);
-      break;
-    }
-    case 'refuse': {
-      if (ws.role === 'host') ws.room.refuse = !!msg.on;
-      break;
-    }
-    case 'kick': {
-      if (ws.role !== 'host') return;
-      const guest = ws.room.guests.get(parseInt(msg.id));
-      if (guest) guest.close();
-      break;
-    }
+      return;
   }
 }
 
-function handleData(ws, buf) {
-  if (!ws.room || buf.length < HEADER_SIZE) return;
+function onBinary(ws, data) {
   const room = ws.room;
-  const target = buf.readInt32LE(0);
-  const mode = buf[4];
-  const channel = buf[5];
-  const payload = buf.subarray(HEADER_SIZE);
-
-  if (ws.role === 'guest') {
-    // Guests only ever talk to the host (the host's Godot relays guest-to-guest)
-    sendBinary(room.host, makeFrame(ws.peerId, mode, channel, payload));
+  if (!room || data.length < HEADER_SIZE) return;
+  if (ws.role === "guest") {
+    const out = Buffer.from(data);
+    out.writeInt32LE(ws.peerId, 0);   // the host sees who sent it
+    if (room.host.readyState === 1) room.host.send(out, { binary: true });
     return;
   }
-
-  // Host: 0 = everyone, positive = that guest, negative = everyone except that guest
-  const frame = makeFrame(1, mode, channel, payload);
+  const target = data.readInt32LE(0);
+  const out = Buffer.from(data);
+  out.writeInt32LE(1, 0);             // guests always see the host as id 1
   if (target > 0) {
-    sendBinary(room.guests.get(target), frame);
+    const guest = room.guests.get(target);
+    if (guest && guest.readyState === 1) guest.send(out, { binary: true });
   } else {
     for (const [id, guest] of room.guests) {
-      if (target === 0 || id !== -target) sendBinary(guest, frame);
+      if (target < 0 && id === -target) continue;
+      if (guest.readyState === 1) guest.send(out, { binary: true });
     }
   }
 }
 
-function handleClose(ws) {
+function onClose(ws) {
   const room = ws.room;
   if (!room) return;
-  if (ws.role === 'host') {
-    // The lobby ends when the host leaves
-    for (const guest of room.guests.values()) guest.close();
-    rooms.delete(room.code);
-    console.log(`Room ${room.code} closed`);
-  } else if (ws.role === 'guest') {
+  if (ws.role === "host") {
+    rooms.delete(room.code);   // the code is free again straight away, so the host can reopen it
+    for (const guest of room.guests.values()) guest.close(1000, "The host closed the lobby.");
+    console.log(`room ${room.code} closed (${rooms.size} rooms)`);
+  } else if (room.guests.get(ws.peerId) === ws) {
     room.guests.delete(ws.peerId);
-    sendJson(room.host, { t: 'peer_left', id: ws.peerId });
-    console.log(`Room ${room.code}: guest ${ws.peerId} left`);
+    send(room.host, { t: "peer_left", id: ws.peerId });
   }
 }
 
-// Ping everyone every 30 seconds: keeps connections open through proxies and drops dead ones
+wss.on("connection", (ws) => {
+  ws.alive = true;
+  ws.on("pong", () => { ws.alive = true; });
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) onBinary(ws, data);
+    else onText(ws, data.toString());
+  });
+  ws.on("close", () => onClose(ws));
+  ws.on("error", () => {});
+});
+
+// Drop connections that stopped answering (a crashed host frees its room code this way)
 setInterval(() => {
   for (const ws of wss.clients) {
-    if (!ws.isAlive) {
-      ws.terminate();
-      continue;
-    }
-    ws.isAlive = false;
+    if (!ws.alive) { ws.terminate(); continue; }
+    ws.alive = false;
     ws.ping();
   }
-}, 30000);
+}, PING_MS);
 
-server.listen(PORT, () => {
-  console.log(`Relay server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`relay listening on :${PORT}`));
