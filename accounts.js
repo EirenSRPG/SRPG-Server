@@ -11,7 +11,7 @@
 //   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online, banned, ban, warnings, requested}]}   staff only
 //   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
 //   POST /account/moderate       {token, username, action, reason, minutes} -> {ok}                staff only
-//                                action: "warn" | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
+//                                action: "warn" | "unwarn" (removes the newest warning) | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
 //   POST /account/request_moderator {token, username}       -> {ok}                                 moderators (asks the admin to promote someone)
 //   POST /account/dismiss_request   {token, username}       -> {ok}                                 admin only
 //   POST /account/filtered      {token, count}             -> {ok, warned}     the game reports words the chat filter blocked; too many in a short time = 1 automatic warning (no moderator name)
@@ -409,6 +409,9 @@ function moderate(res, msg, json) {
   if (action === "warn") {
     if (!reason) return json(res, 400, { error: "Give a reason for the warning." });
     target.warnings = [...(target.warnings || []), { by, reason, at: now, seen: false }].slice(-MAX_WARNINGS);
+  } else if (action === "unwarn") {
+    if (!(target.warnings || []).length) return json(res, 409, { error: "That account has no warnings." });
+    target.warnings = target.warnings.slice(0, -1);   // removes the newest one (call again for the next)
   } else if (action === "tempban") {
     const minutes = Math.floor(Number(msg.minutes));
     if (!(minutes >= 1)) return json(res, 400, { error: "Give the ban length in minutes." });
