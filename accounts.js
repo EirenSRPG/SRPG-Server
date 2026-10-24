@@ -7,6 +7,10 @@
 //   POST /account/save      {token, files, deleted}         -> {ok}      files: {name: {t, d}}  (d = base64)
 //   POST /account/logout    {token}                         -> {ok}
 //   POST /account/delete    {token, password}               -> {ok}      erases the account and every saved file
+//   POST /account/moderators     {token}                    -> {ok, moderators: [names]}          any logged-in account
+//   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online}]}   admin only
+//   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
+// The admin is the account named ADMIN_ACCOUNT. The moderator flag lives on the account row ("moderator": true) so it is saved with it.
 //
 // Errors are {error: "text"} with a 4xx status.
 //
@@ -31,6 +35,9 @@ const MAX_TOTAL_B64 = 8 * 1024 * 1024;
 const MAX_TOKENS = 5;                  // devices signed in at once; the oldest is signed out
 const MAX_FAILS = 8;                   // wrong passwords per 10 minutes (per IP + username)
 const FAIL_WINDOW = 10 * 60 * 1000;
+const ADMIN_ACCOUNT = "eiren";         // the only account that may list accounts and hand out the moderator role (lowercase)
+const ONLINE_MS = 3 * 60 * 1000;       // an account that talked to the server this recently counts as online
+const MAX_LIST = 200;                  // most accounts /account/list returns
 const MAX_REGISTER = 10;               // new accounts per hour per IP
 const REGISTER_WINDOW = 60 * 60 * 1000;
 
@@ -43,6 +50,7 @@ const turso = createClient({
 
 let db = { users: {} };         // lowercase username -> {name, salt, hash, tokens: [sha256], files: {name: {t, d}}, created}
 const tokenIndex = new Map();   // sha256(token) -> lowercase username
+const lastSeen = new Map();     // lowercase username -> time of their last request (memory only, never saved)
 const saved = new Map();        // lowercase username -> the JSON last written to Turso (to find what changed)
 
 let ready = null;
@@ -141,7 +149,9 @@ function issueToken(key) {
 
 function userFromToken(token) {
   const key = tokenIndex.get(sha(str(token)));
-  return key && db.users[key] ? { key, user: db.users[key] } : null;
+  if (!key || !db.users[key]) return null;
+  lastSeen.set(key, Date.now());   // every request from a logged-in game (saves go up every ~20 s) counts as "online"
+  return { key, user: db.users[key] };
 }
 
 const buckets = new Map();   // rate limits: key -> {start, count}
@@ -272,6 +282,45 @@ function saveFiles(res, msg, json) {
   return json(res, 200, { ok: true });
 }
 
+// Who has the blue shield. Any logged-in account may ask (every game downloads this so chat can show the shield).
+function listModerators(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  const names = Object.values(db.users).filter((u) => u.moderator === true).map((u) => u.name);
+  return json(res, 200, { ok: true, moderators: names });
+}
+
+// Admin only: every account (or the ones whose name contains `query`), online ones first, then A-Z
+function listAccounts(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (auth.key !== ADMIN_ACCOUNT) return json(res, 403, { error: "Not allowed." });
+  const query = str(msg.query).trim().toLowerCase().slice(0, 16);
+  const now = Date.now();
+  const list = [];
+  for (const [key, user] of Object.entries(db.users)) {
+    if (query && !key.includes(query)) continue;
+    list.push({ username: user.name, moderator: user.moderator === true, online: now - (lastSeen.get(key) || 0) < ONLINE_MS });
+  }
+  list.sort((a, b) => (b.online - a.online) || a.username.toLowerCase().localeCompare(b.username.toLowerCase()));
+  return json(res, 200, { ok: true, accounts: list.slice(0, MAX_LIST) });
+}
+
+// Admin only: give or take away the moderator role
+function setModerator(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (auth.key !== ADMIN_ACCOUNT) return json(res, 403, { error: "Not allowed." });
+  const key = str(msg.username).trim().toLowerCase();
+  const target = db.users[key];
+  if (!target) return json(res, 404, { error: "No such account." });
+  if (msg.moderator === true) target.moderator = true;
+  else delete target.moderator;
+  persist();
+  console.log(`moderator ${msg.moderator === true ? "given to" : "removed from"} ${target.name}`);
+  return json(res, 200, { ok: true });
+}
+
 function logout(res, msg, json) {
   const auth = userFromToken(msg.token);
   if (auth) {
@@ -300,6 +349,9 @@ async function handle(req, res, url, json) {
       case "/account/load": return loadFiles(res, msg, json);
       case "/account/save": return saveFiles(res, msg, json);
       case "/account/logout": return logout(res, msg, json);
+      case "/account/moderators": return listModerators(res, msg, json);
+      case "/account/list": return listAccounts(res, msg, json);
+      case "/account/set_moderator": return setModerator(res, msg, json);
       default: return json(res, 404, { error: "Not found." });
     }
   } catch (e) {
