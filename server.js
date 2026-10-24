@@ -87,6 +87,11 @@ const server = http.createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
+// A multiplayer ban or account ban also removes that player from the lobby they are in right now
+accounts.setBanHook((key, reason) => {
+  for (const ws of wss.clients) if (ws.accountKey === key) fail(ws, reason);
+});
+
 function send(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
@@ -103,6 +108,18 @@ function newCode() {
     if (!rooms.has(code)) return code;
   }
   return null;
+}
+
+// Hosting or joining needs a logged-in account that isn't banned from multiplayer (the game sends its login token).
+async function gated(ws, msg, action) {
+  if (ws.room || ws.gating) return;
+  ws.gating = true;
+  const gate = await accounts.multiplayerGate(msg.token);
+  ws.gating = false;
+  if (ws.readyState !== 1) return;
+  if (!gate.ok) return fail(ws, gate.reason);
+  ws.accountKey = gate.key;
+  action(ws, msg);
 }
 
 function hostRoom(ws, msg) {
@@ -145,8 +162,8 @@ function onText(ws, text) {
   try { msg = JSON.parse(text); } catch (e) { return; }
   if (!msg || typeof msg !== "object") return;
   switch (msg.t) {
-    case "host": return hostRoom(ws, msg);
-    case "join": return joinRoom(ws, msg);
+    case "host": return gated(ws, msg, hostRoom);
+    case "join": return gated(ws, msg, joinRoom);
     case "refuse":
       if (ws.role === "host") ws.room.refuse = !!msg.on;
       return;

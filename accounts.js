@@ -8,9 +8,16 @@
 //   POST /account/logout    {token}                         -> {ok}
 //   POST /account/delete    {token, password}               -> {ok}      erases the account and every saved file
 //   POST /account/moderators     {token}                    -> {ok, moderators: [names]}          any logged-in account
-//   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online}]}   admin only
+//   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online, banned, ban, warnings, requested}]}   staff only
 //   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
-// The admin is the account named ADMIN_ACCOUNT. The moderator flag lives on the account row ("moderator": true) so it is saved with it.
+//   POST /account/moderate       {token, username, action, reason, minutes} -> {ok}                staff only
+//                                action: "warn" | "tempban" (minutes) | "ban" (complete, permanent) | "unban"
+//   POST /account/request_moderator {token, username}       -> {ok}                                 moderators (asks the admin to promote someone)
+//   POST /account/dismiss_request   {token, username}       -> {ok}                                 admin only
+//   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}]}
+//                                warnings are handed out once; mod_requests only for the admin
+// The admin is the account named ADMIN_ACCOUNT. "Staff" = the admin + every account with "moderator": true.
+// The moderator flag, bans, warnings and promotion requests all live on the account row, so they are saved with it.
 //
 // Errors are {error: "text"} with a 4xx status.
 //
@@ -40,6 +47,11 @@ const ONLINE_MS = 3 * 60 * 1000;       // an account that talked to the server t
 const MAX_LIST = 200;                  // most accounts /account/list returns
 const MAX_REGISTER = 10;               // new accounts per hour per IP
 const REGISTER_WINDOW = 60 * 60 * 1000;
+const MOD_CAN_PERMBAN = true;          // false: only the admin may hand out complete (permanent) bans
+const MAX_TEMP_MINUTES = 30 * 24 * 60; // longest temp ban (longer = a complete ban)
+const MAX_REASON = 200;
+const MAX_WARNINGS = 20;               // warnings kept per account (oldest dropped)
+const MAX_MOD_REQUESTS = 10;           // pending "make X a moderator" requests kept per target
 
 // ---------- storage ----------
 
@@ -191,6 +203,43 @@ function readBody(req) {
   });
 }
 
+// ---------- roles, bans, warnings ----------
+
+const isAdmin = (key) => key === ADMIN_ACCOUNT;
+const isStaff = (key) => isAdmin(key) || (db.users[key] && db.users[key].moderator === true);
+
+// ban = {scope: "multiplayer" | "account", until: ms (0 = permanent), reason, by, at}
+// "multiplayer" (temp bans) only blocks hosting/joining; "account" (complete bans) also blocks logging in.
+function activeBan(user) {
+  const ban = user.ban;
+  if (!ban) return null;
+  if (ban.until > 0 && ban.until <= Date.now()) {   // a temp ban that ran out
+    delete user.ban;
+    persist();
+    return null;
+  }
+  return ban;
+}
+
+function banText(ban) {
+  const when = ban.until > 0 ? "until " + new Date(ban.until).toUTCString() : "permanently";
+  return `You are banned ${when}.` + (ban.reason ? " Reason: " + ban.reason : "");
+}
+
+let banHook = () => {};
+// server.js registers this so a ban also removes the player from the lobby they are in right now: hook(key, reason)
+function setBanHook(fn) { banHook = typeof fn === "function" ? fn : () => {}; }
+
+// Hosting or joining needs a logged-in account that isn't banned. Returns {ok, key} or {ok: false, reason}.
+async function multiplayerGate(token) {
+  try { await ensureReady(); } catch (e) { return { ok: false, reason: "Accounts are unavailable right now. Try again in a moment." }; }
+  const auth = userFromToken(token);
+  if (!auth) return { ok: false, reason: "Please log in to play multiplayer." };
+  const ban = activeBan(auth.user);
+  if (ban) return { ok: false, reason: banText(ban) };
+  return { ok: true, key: auth.key };
+}
+
 // ---------- routes ----------
 
 async function register(req, res, msg, json) {
@@ -232,6 +281,8 @@ async function login(req, res, msg, json) {
     return json(res, 401, { error: "Wrong username or password." });
   }
   buckets.delete(bucket);
+  const ban = activeBan(db.users[key]);
+  if (ban && ban.scope === "account") return json(res, 403, { error: banText(ban) });
   const token = issueToken(key);
   persist();
   return json(res, 200, { ok: true, token, username: db.users[key].name });
@@ -240,6 +291,7 @@ async function login(req, res, msg, json) {
 async function deleteAccount(req, res, msg, json) {
   const auth = userFromToken(msg.token);
   if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (activeBan(auth.user)) return json(res, 403, { error: "A banned account can't be deleted." });
   const bucket = "login:" + clientIp(req) + "|" + auth.key;
   if (tooMany(bucket, MAX_FAILS, FAIL_WINDOW)) return json(res, 429, { error: "Too many attempts. Try again in a few minutes." });
   if (!(await passwordOk(auth.key, str(msg.password).slice(0, MAX_PASSWORD)))) {
@@ -290,17 +342,26 @@ function listModerators(res, msg, json) {
   return json(res, 200, { ok: true, moderators: names });
 }
 
-// Admin only: every account (or the ones whose name contains `query`), online ones first, then A-Z
+// Staff only (admin + moderators): every account (or the ones whose name contains `query`), online ones first, then A-Z
 function listAccounts(res, msg, json) {
   const auth = userFromToken(msg.token);
   if (!auth) return json(res, 401, { error: "Please log in again." });
-  if (auth.key !== ADMIN_ACCOUNT) return json(res, 403, { error: "Not allowed." });
+  if (!isStaff(auth.key)) return json(res, 403, { error: "Not allowed." });
   const query = str(msg.query).trim().toLowerCase().slice(0, 16);
   const now = Date.now();
   const list = [];
   for (const [key, user] of Object.entries(db.users)) {
     if (query && !key.includes(query)) continue;
-    list.push({ username: user.name, moderator: user.moderator === true, online: now - (lastSeen.get(key) || 0) < ONLINE_MS });
+    const ban = activeBan(user);
+    list.push({
+      username: user.name,
+      moderator: user.moderator === true,
+      online: now - (lastSeen.get(key) || 0) < ONLINE_MS,
+      banned: !!ban,
+      ban: ban ? { scope: ban.scope, until: ban.until, reason: ban.reason, by: ban.by } : null,
+      warnings: (user.warnings || []).length,
+      requested: (user.modRequests || []).length > 0,
+    });
   }
   list.sort((a, b) => (b.online - a.online) || a.username.toLowerCase().localeCompare(b.username.toLowerCase()));
   return json(res, 200, { ok: true, accounts: list.slice(0, MAX_LIST) });
@@ -316,9 +377,107 @@ function setModerator(res, msg, json) {
   if (!target) return json(res, 404, { error: "No such account." });
   if (msg.moderator === true) target.moderator = true;
   else delete target.moderator;
+  delete target.modRequests;   // answered either way
   persist();
   console.log(`moderator ${msg.moderator === true ? "given to" : "removed from"} ${target.name}`);
   return json(res, 200, { ok: true });
+}
+
+// Staff: warn, temp ban, complete ban, or lift a ban
+function moderate(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (!isStaff(auth.key)) return json(res, 403, { error: "Not allowed." });
+  const key = str(msg.username).trim().toLowerCase();
+  const target = db.users[key];
+  if (!target) return json(res, 404, { error: "No such account." });
+  if (key === auth.key) return json(res, 400, { error: "You can't do that to your own account." });
+  if (isAdmin(key)) return json(res, 403, { error: "That account can't be moderated." });
+  if (target.moderator === true && !isAdmin(auth.key)) return json(res, 403, { error: "Only the admin can moderate other moderators." });
+
+  const by = db.users[auth.key].name;
+  const reason = str(msg.reason).trim().slice(0, MAX_REASON);
+  const now = Date.now();
+  const action = str(msg.action);
+
+  if (action === "warn") {
+    if (!reason) return json(res, 400, { error: "Give a reason for the warning." });
+    target.warnings = [...(target.warnings || []), { by, reason, at: now, seen: false }].slice(-MAX_WARNINGS);
+  } else if (action === "tempban") {
+    const minutes = Math.floor(Number(msg.minutes));
+    if (!(minutes >= 1)) return json(res, 400, { error: "Give the ban length in minutes." });
+    if (minutes > MAX_TEMP_MINUTES) return json(res, 400, { error: "Temp bans are 30 days at most. Use a complete ban instead." });
+    if (target.ban && target.ban.scope === "account") return json(res, 409, { error: "That account is already completely banned." });
+    target.ban = { scope: "multiplayer", until: now + minutes * 60000, reason, by, at: now };
+  } else if (action === "ban") {
+    if (!MOD_CAN_PERMBAN && !isAdmin(auth.key)) return json(res, 403, { error: "Only the admin can give complete bans." });
+    target.ban = { scope: "account", until: 0, reason, by, at: now };
+    for (const h of target.tokens || []) tokenIndex.delete(h);   // signs them out everywhere
+    target.tokens = [];
+  } else if (action === "unban") {
+    if (!target.ban) return json(res, 409, { error: "That account isn't banned." });
+    delete target.ban;
+  } else {
+    return json(res, 400, { error: "Unknown action." });
+  }
+  persist();
+  console.log(`moderation: ${by} -> ${action} -> ${target.name}${reason ? " (" + reason + ")" : ""}`);
+  if (target.ban && (action === "tempban" || action === "ban")) banHook(key, banText(target.ban));   // kick them from their lobby now
+  return json(res, 200, { ok: true });
+}
+
+// Moderators can't promote anyone themselves: this leaves a request for the admin ("this person wants to make this person a moderator")
+function requestModerator(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (!isStaff(auth.key)) return json(res, 403, { error: "Not allowed." });
+  if (isAdmin(auth.key)) return json(res, 400, { error: "You can make moderators directly." });
+  if (tooMany("modreq:" + auth.key, 10, 60 * 60 * 1000)) return json(res, 429, { error: "Too many requests. Try again later." });
+  const key = str(msg.username).trim().toLowerCase();
+  const target = db.users[key];
+  if (!target) return json(res, 404, { error: "No such account." });
+  if (isAdmin(key) || target.moderator === true) return json(res, 409, { error: "That player is already a moderator." });
+  const by = db.users[auth.key].name;
+  const requests = target.modRequests || [];
+  if (requests.some((r) => r.by === by)) return json(res, 409, { error: "You already asked for this player." });
+  target.modRequests = [...requests, { by, at: Date.now() }].slice(-MAX_MOD_REQUESTS);
+  bump("modreq:" + auth.key, 60 * 60 * 1000);
+  persist();
+  console.log(`moderation: ${by} asked for ${target.name} to become a moderator`);
+  return json(res, 200, { ok: true });
+}
+
+// Admin only: throw a promotion request away without promoting
+function dismissRequest(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (!isAdmin(auth.key)) return json(res, 403, { error: "Not allowed." });
+  const target = db.users[str(msg.username).trim().toLowerCase()];
+  if (!target) return json(res, 404, { error: "No such account." });
+  delete target.modRequests;
+  persist();
+  return json(res, 200, { ok: true });
+}
+
+// Polled by every game: new warnings for you (each one is returned once), and for the admin the open promotion requests
+function notices(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  const fresh = (auth.user.warnings || []).filter((w) => !w.seen);
+  if (fresh.length) {
+    for (const w of fresh) w.seen = true;
+    persist();
+  }
+  const out = { ok: true, warnings: fresh.map((w) => ({ by: w.by, reason: w.reason, at: w.at })) };
+  if (isAdmin(auth.key)) {
+    out.mod_requests = [];
+    for (const user of Object.values(db.users)) {
+      if (user.moderator === true || !(user.modRequests || []).length) continue;
+      out.mod_requests.push({ username: user.name, by: user.modRequests.map((r) => r.by), at: Math.max(...user.modRequests.map((r) => r.at)) });
+    }
+    out.mod_requests.sort((a, b) => a.at - b.at);
+  }
+  return json(res, 200, out);
 }
 
 function logout(res, msg, json) {
@@ -352,6 +511,10 @@ async function handle(req, res, url, json) {
       case "/account/moderators": return listModerators(res, msg, json);
       case "/account/list": return listAccounts(res, msg, json);
       case "/account/set_moderator": return setModerator(res, msg, json);
+      case "/account/moderate": return moderate(res, msg, json);
+      case "/account/request_moderator": return requestModerator(res, msg, json);
+      case "/account/dismiss_request": return dismissRequest(res, msg, json);
+      case "/account/notices": return notices(res, msg, json);
       default: return json(res, 404, { error: "Not found." });
     }
   } catch (e) {
@@ -360,4 +523,4 @@ async function handle(req, res, url, json) {
   }
 }
 
-module.exports = { handle };
+module.exports = { handle, multiplayerGate, setBanHook };
