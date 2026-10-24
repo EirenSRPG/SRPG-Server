@@ -11,10 +11,10 @@
 //   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online, banned, ban, warnings, requested}]}   staff only
 //   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
 //   POST /account/moderate       {token, username, action, reason, minutes} -> {ok}                staff only
-//                                action: "warn" | "unwarn" (removes the newest warning) | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
-//                                every WARN_LIMIT-th warning (3rd, 6th, ...) also gives an automatic 1 day multiplayer ban; the reply then has auto_banned: true"
+//                                action: "warn" | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
 //   POST /account/request_moderator {token, username}       -> {ok}                                 moderators (asks the admin to promote someone)
 //   POST /account/dismiss_request   {token, username}       -> {ok}                                 admin only
+//   POST /account/filtered      {token, count}             -> {ok, warned}     the game reports words the chat filter blocked; too many in a short time = 1 automatic warning (no moderator name)
 //   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}]}
 //                                warnings are handed out once; mod_requests only for the admin
 // The admin is the account named ADMIN_ACCOUNT. "Staff" = the admin + every account with "moderator": true.
@@ -51,9 +51,11 @@ const REGISTER_WINDOW = 60 * 60 * 1000;
 const MOD_CAN_PERMBAN = true;          // false: only the admin may hand out full (permanent) multiplayer bans
 const MAX_TEMP_MINUTES = 30 * 24 * 60; // longest temp ban (longer = a complete ban)
 const MAX_REASON = 200;
-const MAX_WARNINGS = 99;               // warnings kept per account (oldest dropped)
-const WARN_LIMIT = 3;                  // every this-many warnings = an automatic temp ban
-const WARN_BAN_MINUTES = 24 * 60;      // ...of this length (never shortens a longer ban the player already has)
+const MAX_WARNINGS = 20;               // warnings kept per account (oldest dropped)
+const FILTER_LIMIT = 5;                // blocked chat words within FILTER_WINDOW that earn one automatic warning
+const FILTER_WINDOW = 60 * 1000;
+const FILTER_MAX_REPORT = 20;          // most words one report can add (a message is at most 100 characters)
+const FILTER_WARNING = "You used too many words that the chat filter blocks. Please keep the chat friendly.";
 const MAX_MOD_REQUESTS = 10;           // pending "make X a moderator" requests kept per target
 
 // ---------- storage ----------
@@ -65,6 +67,7 @@ const turso = createClient({
 
 let db = { users: {} };         // lowercase username -> {name, salt, hash, tokens: [sha256], files: {name: {t, d}}, created}
 const tokenIndex = new Map();   // sha256(token) -> lowercase username
+const filterHits = new Map();   // lowercase username -> [{at, count}] blocked words reported recently (memory only)
 const lastSeen = new Map();     // lowercase username -> time of their last request (memory only, never saved)
 const saved = new Map();        // lowercase username -> the JSON last written to Turso (to find what changed)
 
@@ -402,25 +405,10 @@ function moderate(res, msg, json) {
   const reason = str(msg.reason).trim().slice(0, MAX_REASON);
   const now = Date.now();
   const action = str(msg.action);
-  const extra = {};
-  let autoBanned = false;
 
   if (action === "warn") {
     if (!reason) return json(res, 400, { error: "Give a reason for the warning." });
     target.warnings = [...(target.warnings || []), { by, reason, at: now, seen: false }].slice(-MAX_WARNINGS);
-    if (target.warnings.length % WARN_LIMIT === 0) {   // 3rd, 6th, 9th... warning
-      const until = now + WARN_BAN_MINUTES * 60000;
-      const current = target.ban;
-      if (!current || (current.until > 0 && current.until < until)) {   // keep a permanent or longer ban as it is
-        target.ban = { scope: "multiplayer", until, reason: `${WARN_LIMIT} warnings (automatic)`, by: "automatic", at: now };
-        autoBanned = true;
-        extra.auto_banned = true;
-        extra.ban_until = until;
-      }
-    }
-  } else if (action === "unwarn") {
-    if (!(target.warnings || []).length) return json(res, 409, { error: "That account has no warnings." });
-    target.warnings = target.warnings.slice(0, -1);   // newest first out; a ban an earlier warning caused stays until lifted
   } else if (action === "tempban") {
     const minutes = Math.floor(Number(msg.minutes));
     if (!(minutes >= 1)) return json(res, 400, { error: "Give the ban length in minutes." });
@@ -438,8 +426,31 @@ function moderate(res, msg, json) {
   }
   persist();
   console.log(`moderation: ${by} -> ${action} -> ${target.name}${reason ? " (" + reason + ")" : ""}`);
-  if (target.ban && (action === "tempban" || action === "ban" || autoBanned)) banHook(key, banText(target.ban));   // kick them from their lobby now
-  return json(res, 200, { ok: true, ...extra });
+  if (target.ban && (action === "tempban" || action === "ban")) banHook(key, banText(target.ban));   // kick them from their lobby now
+  return json(res, 200, { ok: true });
+}
+
+// The game reports how many words the chat filter blocked in a message the player sent. Reaching FILTER_LIMIT words inside
+// FILTER_WINDOW gives them one warning. It is stored with by: "" so the popup shows only the reason, never who gave it.
+function filtered(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  const count = Math.min(Math.floor(Number(msg.count)) || 0, FILTER_MAX_REPORT);
+  if (count < 1) return json(res, 400, { error: "Bad request." });
+  const now = Date.now();
+  const hits = (filterHits.get(auth.key) || []).filter((h) => now - h.at < FILTER_WINDOW);
+  hits.push({ at: now, count });
+  let warned = false;
+  if (hits.reduce((sum, h) => sum + h.count, 0) >= FILTER_LIMIT) {
+    auth.user.warnings = [...(auth.user.warnings || []), { by: "", reason: FILTER_WARNING, at: now, seen: false }].slice(-MAX_WARNINGS);
+    filterHits.delete(auth.key);   // start counting from zero again
+    warned = true;
+    persist();
+    console.log(`moderation: chat filter warned ${auth.user.name}`);
+  } else {
+    filterHits.set(auth.key, hits);
+  }
+  return json(res, 200, { ok: true, warned });
 }
 
 // Moderators can't promote anyone themselves: this leaves a request for the admin ("this person wants to make this person a moderator")
@@ -531,6 +542,7 @@ async function handle(req, res, url, json) {
       case "/account/request_moderator": return requestModerator(res, msg, json);
       case "/account/dismiss_request": return dismissRequest(res, msg, json);
       case "/account/notices": return notices(res, msg, json);
+      case "/account/filtered": return filtered(res, msg, json);
       default: return json(res, 404, { error: "Not found." });
     }
   } catch (e) {
