@@ -11,7 +11,7 @@
 //   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online, banned, ban, warnings, requested}]}   staff only
 //   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
 //   POST /account/moderate       {token, username, action, reason, minutes} -> {ok}                staff only
-//                                action: "warn" | "tempban" (minutes) | "ban" (complete, permanent) | "unban"
+//                                action: "warn" | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
 //   POST /account/request_moderator {token, username}       -> {ok}                                 moderators (asks the admin to promote someone)
 //   POST /account/dismiss_request   {token, username}       -> {ok}                                 admin only
 //   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}]}
@@ -47,7 +47,7 @@ const ONLINE_MS = 3 * 60 * 1000;       // an account that talked to the server t
 const MAX_LIST = 200;                  // most accounts /account/list returns
 const MAX_REGISTER = 10;               // new accounts per hour per IP
 const REGISTER_WINDOW = 60 * 60 * 1000;
-const MOD_CAN_PERMBAN = true;          // false: only the admin may hand out complete (permanent) bans
+const MOD_CAN_PERMBAN = true;          // false: only the admin may hand out full (permanent) multiplayer bans
 const MAX_TEMP_MINUTES = 30 * 24 * 60; // longest temp ban (longer = a complete ban)
 const MAX_REASON = 200;
 const MAX_WARNINGS = 20;               // warnings kept per account (oldest dropped)
@@ -209,7 +209,7 @@ const isAdmin = (key) => key === ADMIN_ACCOUNT;
 const isStaff = (key) => isAdmin(key) || (db.users[key] && db.users[key].moderator === true);
 
 // ban = {scope: "multiplayer" | "account", until: ms (0 = permanent), reason, by, at}
-// "multiplayer" (temp bans) only blocks hosting/joining; "account" (complete bans) also blocks logging in.
+// "multiplayer" (temp and full bans; until 0 = permanent) blocks hosting/joining. "account" (unused by the menu) would also block login.
 function activeBan(user) {
   const ban = user.ban;
   if (!ban) return null;
@@ -406,14 +406,12 @@ function moderate(res, msg, json) {
   } else if (action === "tempban") {
     const minutes = Math.floor(Number(msg.minutes));
     if (!(minutes >= 1)) return json(res, 400, { error: "Give the ban length in minutes." });
-    if (minutes > MAX_TEMP_MINUTES) return json(res, 400, { error: "Temp bans are 30 days at most. Use a complete ban instead." });
-    if (target.ban && target.ban.scope === "account") return json(res, 409, { error: "That account is already completely banned." });
+    if (minutes > MAX_TEMP_MINUTES) return json(res, 400, { error: "Temp bans are 30 days at most. Use a full ban instead." });
+    if (target.ban && target.ban.until === 0) return json(res, 409, { error: "That account is already banned permanently." });
     target.ban = { scope: "multiplayer", until: now + minutes * 60000, reason, by, at: now };
   } else if (action === "ban") {
-    if (!MOD_CAN_PERMBAN && !isAdmin(auth.key)) return json(res, 403, { error: "Only the admin can give complete bans." });
-    target.ban = { scope: "account", until: 0, reason, by, at: now };
-    for (const h of target.tokens || []) tokenIndex.delete(h);   // signs them out everywhere
-    target.tokens = [];
+    if (!MOD_CAN_PERMBAN && !isAdmin(auth.key)) return json(res, 403, { error: "Only the admin can give full bans." });
+    target.ban = { scope: "multiplayer", until: 0, reason, by, at: now };   // permanent multiplayer ban; saves and login still work
   } else if (action === "unban") {
     if (!target.ban) return json(res, 409, { error: "That account isn't banned." });
     delete target.ban;
