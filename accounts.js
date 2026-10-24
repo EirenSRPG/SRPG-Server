@@ -11,7 +11,8 @@
 //   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online, banned, ban, warnings, requested}]}   staff only
 //   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
 //   POST /account/moderate       {token, username, action, reason, minutes} -> {ok}                staff only
-//                                action: "warn" | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
+//                                action: "warn" | "unwarn" (removes the newest warning) | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
+//                                every WARN_LIMIT-th warning (3rd, 6th, ...) also gives an automatic 1 day multiplayer ban; the reply then has auto_banned: true"
 //   POST /account/request_moderator {token, username}       -> {ok}                                 moderators (asks the admin to promote someone)
 //   POST /account/dismiss_request   {token, username}       -> {ok}                                 admin only
 //   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}]}
@@ -50,7 +51,9 @@ const REGISTER_WINDOW = 60 * 60 * 1000;
 const MOD_CAN_PERMBAN = true;          // false: only the admin may hand out full (permanent) multiplayer bans
 const MAX_TEMP_MINUTES = 30 * 24 * 60; // longest temp ban (longer = a complete ban)
 const MAX_REASON = 200;
-const MAX_WARNINGS = 20;               // warnings kept per account (oldest dropped)
+const MAX_WARNINGS = 99;               // warnings kept per account (oldest dropped)
+const WARN_LIMIT = 3;                  // every this-many warnings = an automatic temp ban
+const WARN_BAN_MINUTES = 24 * 60;      // ...of this length (never shortens a longer ban the player already has)
 const MAX_MOD_REQUESTS = 10;           // pending "make X a moderator" requests kept per target
 
 // ---------- storage ----------
@@ -399,10 +402,25 @@ function moderate(res, msg, json) {
   const reason = str(msg.reason).trim().slice(0, MAX_REASON);
   const now = Date.now();
   const action = str(msg.action);
+  const extra = {};
+  let autoBanned = false;
 
   if (action === "warn") {
     if (!reason) return json(res, 400, { error: "Give a reason for the warning." });
     target.warnings = [...(target.warnings || []), { by, reason, at: now, seen: false }].slice(-MAX_WARNINGS);
+    if (target.warnings.length % WARN_LIMIT === 0) {   // 3rd, 6th, 9th... warning
+      const until = now + WARN_BAN_MINUTES * 60000;
+      const current = target.ban;
+      if (!current || (current.until > 0 && current.until < until)) {   // keep a permanent or longer ban as it is
+        target.ban = { scope: "multiplayer", until, reason: `${WARN_LIMIT} warnings (automatic)`, by: "automatic", at: now };
+        autoBanned = true;
+        extra.auto_banned = true;
+        extra.ban_until = until;
+      }
+    }
+  } else if (action === "unwarn") {
+    if (!(target.warnings || []).length) return json(res, 409, { error: "That account has no warnings." });
+    target.warnings = target.warnings.slice(0, -1);   // newest first out; a ban an earlier warning caused stays until lifted
   } else if (action === "tempban") {
     const minutes = Math.floor(Number(msg.minutes));
     if (!(minutes >= 1)) return json(res, 400, { error: "Give the ban length in minutes." });
@@ -420,8 +438,8 @@ function moderate(res, msg, json) {
   }
   persist();
   console.log(`moderation: ${by} -> ${action} -> ${target.name}${reason ? " (" + reason + ")" : ""}`);
-  if (target.ban && (action === "tempban" || action === "ban")) banHook(key, banText(target.ban));   // kick them from their lobby now
-  return json(res, 200, { ok: true });
+  if (target.ban && (action === "tempban" || action === "ban" || autoBanned)) banHook(key, banText(target.ban));   // kick them from their lobby now
+  return json(res, 200, { ok: true, ...extra });
 }
 
 // Moderators can't promote anyone themselves: this leaves a request for the admin ("this person wants to make this person a moderator")
