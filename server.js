@@ -11,6 +11,14 @@
 //                     {t:"peer_left", id}       host only
 //                     {t:"error", reason}       then the socket is closed
 //
+// General lobby (a hangout run by this server, nobody hosts it; it exists while somebody is inside):
+//   client -> server: {t:"hall", token, name}     enter the general lobby (the fullest hall with room, or a new one when all are full)
+//                     {t:"hmove", x, y}           my position
+//                     {t:"hemote", e}             an emote (0-7)
+//                     {t:"hleave"}                leave the hall
+//   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c}]}
+//                     {t:"hall_peer", id, name, x, y, c} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e}
+//
 // Binary messages are game packets: int32 LE (target when sending / sender when receiving), mode byte, channel byte, payload.
 //   guest -> host only (the host's Godot relays guest-to-guest messages)
 //   host  -> target > 0: that guest | 0: every guest | < 0: every guest except abs(target)
@@ -24,9 +32,14 @@ const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no I, O, 0, 1
 const CODE_RE = /^[A-Z0-9]{4,6}$/;
 const HEADER_SIZE = 6;
 const MAX_ROOM_SIZE = 8;
+const HALL_MAX = 30;              // players in one general lobby hall
+const HALL_W = 640, HALL_H = 384; // the hall's size in pixels (hall.gd uses the same numbers)
+const HALL_EMOTES = 8;
 const PING_MS = 25000;   // keeps idle connections open behind proxies (Render closes silent ones)
 
 const rooms = new Map();   // code -> {code, host, guests: Map(id -> ws), max, refuse, nextId}
+
+const halls = new Map();   // number -> {number, members: Map(id -> ws), nextId}
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -112,7 +125,7 @@ function newCode() {
 
 // Hosting or joining needs a logged-in account that isn't banned from multiplayer (the game sends its login token).
 async function gated(ws, msg, action) {
-  if (ws.room || ws.gating) return;
+  if (ws.room || ws.hall || ws.gating) return;
   ws.gating = true;
   const gate = await accounts.multiplayerGate(msg.token);
   ws.gating = false;
@@ -157,6 +170,84 @@ function joinRoom(ws, msg) {
   send(room.host, { t: "peer_joined", id });
 }
 
+function toRoman(n) {
+  const table = [[1000, "M"], [900, "CM"], [500, "D"], [400, "CD"], [100, "C"], [90, "XC"], [50, "L"], [40, "XL"], [10, "X"], [9, "IX"], [5, "V"], [4, "IV"], [1, "I"]];
+  let out = "";
+  for (const [value, text] of table) while (n >= value) { out += text; n -= value; }
+  return out;
+}
+
+function hallSend(hall, obj, except) {
+  const text = JSON.stringify(obj);
+  for (const member of hall.members.values()) if (member !== except && member.readyState === 1) member.send(text);
+}
+
+function hallInfo(ws) {
+  return { id: ws.hallId, name: ws.hallName, x: Math.round(ws.hx), y: Math.round(ws.hy), c: ws.hallId % 8 };
+}
+
+// The fullest hall that has room, so people gather together; a new hall only when every hall is full. Halls vanish when empty.
+function joinHall(ws, msg) {
+  if (ws.room || ws.hall) return;
+  let hall = null;
+  for (const h of halls.values()) {
+    if (h.members.size >= HALL_MAX) continue;
+    if (!hall || h.members.size > hall.members.size) hall = h;
+  }
+  if (!hall) {
+    let number = 1;
+    while (halls.has(number)) number++;   // a closed hall's number is reused
+    hall = { number, members: new Map(), nextId: 1 };
+    halls.set(number, hall);
+    console.log(`Great Hall ${toRoman(number)} opened (${halls.size} halls)`);
+  }
+  ws.hall = hall;
+  ws.hallId = hall.nextId++;
+  ws.hallName = (typeof msg.name === "string" ? msg.name.replace(/[^\x20-\x7E]/g, "").trim().slice(0, 14) : "") || "Traveller";
+  ws.hx = HALL_W / 2 + (Math.random() - 0.5) * 80;
+  ws.hy = HALL_H - 60 + (Math.random() - 0.5) * 20;
+  ws.hLast = 0;
+  const players = [...hall.members.values()].map(hallInfo);
+  hall.members.set(ws.hallId, ws);
+  send(ws, { t: "hall_joined", id: ws.hallId, hall: "Great Hall " + toRoman(hall.number), max: HALL_MAX, x: Math.round(ws.hx), y: Math.round(ws.hy), players });
+  hallSend(hall, { t: "hall_peer", ...hallInfo(ws) }, ws);
+}
+
+function leaveHall(ws) {
+  const hall = ws.hall;
+  if (!hall) return;
+  ws.hall = null;
+  hall.members.delete(ws.hallId);
+  if (hall.members.size === 0) {
+    halls.delete(hall.number);
+    console.log(`Great Hall ${toRoman(hall.number)} closed (${halls.size} halls)`);
+  } else {
+    hallSend(hall, { t: "hall_peer_left", id: ws.hallId });
+  }
+}
+
+function onHallMessage(ws, msg) {
+  const hall = ws.hall;
+  const now = Date.now();
+  if (msg.t === "hmove") {
+    if (now - ws.hLast < 60) return;   // at most ~16 updates a second per player
+    ws.hLast = now;
+    const x = Number(msg.x), y = Number(msg.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    ws.hx = Math.min(Math.max(x, 0), HALL_W);
+    ws.hy = Math.min(Math.max(y, 0), HALL_H);
+    hallSend(hall, { t: "hm", id: ws.hallId, x: Math.round(ws.hx), y: Math.round(ws.hy) }, ws);
+  } else if (msg.t === "hemote") {
+    if (now - (ws.hEmoteAt || 0) < 800) return;
+    const e = parseInt(msg.e, 10);
+    if (!(e >= 0 && e < HALL_EMOTES)) return;
+    ws.hEmoteAt = now;
+    hallSend(hall, { t: "he", id: ws.hallId, e });
+  } else if (msg.t === "hleave") {
+    leaveHall(ws);
+  }
+}
+
 function onText(ws, text) {
   let msg;
   try { msg = JSON.parse(text); } catch (e) { return; }
@@ -164,6 +255,10 @@ function onText(ws, text) {
   switch (msg.t) {
     case "host": return gated(ws, msg, hostRoom);
     case "join": return gated(ws, msg, joinRoom);
+    case "hall": return gated(ws, msg, joinHall);
+    case "hmove": case "hemote": case "hleave":
+      if (ws.hall) onHallMessage(ws, msg);
+      return;
     case "refuse":
       if (ws.role === "host") ws.room.refuse = !!msg.on;
       return;
@@ -200,6 +295,7 @@ function onBinary(ws, data) {
 }
 
 function onClose(ws) {
+  leaveHall(ws);
   const room = ws.room;
   if (!room) return;
   if (ws.role === "host") {
