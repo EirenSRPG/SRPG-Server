@@ -11,12 +11,14 @@
 //   POST /account/list           {token, query}             -> {ok, accounts: [{username, moderator, online, banned, ban, warnings, requested}]}   staff only
 //   POST /account/set_moderator  {token, username, moderator} -> {ok}                              admin only
 //   POST /account/moderate       {token, username, action, reason, minutes} -> {ok}                staff only
-//                                action: "warn" | "unwarn" (removes the newest warning) | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
+//                                action: "warn" | "tempban" (minutes) | "ban" (full multiplayer ban, permanent) | "unban"
 //   POST /account/request_moderator {token, username}       -> {ok}                                 moderators (asks the admin to promote someone)
 //   POST /account/dismiss_request   {token, username}       -> {ok}                                 admin only
 //   POST /account/filtered      {token, count}             -> {ok, warned}     the game reports words the chat filter blocked; too many in a short time = 1 automatic warning (no moderator name)
-//   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}]}
-//                                warnings are handed out once; mod_requests only for the admin
+//   POST /account/report        {token, target, account, reason} -> {ok}    any logged-in account reports a player (target = character name,
+//                                account = their account name if the game knows it, else ""). Goes to the admin + every moderator.
+//   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}], reports?: [{from, target, account, reason, at}]}
+//                                warnings are handed out once; mod_requests only for the admin; reports (staff only) are handed out once per staff account
 // The admin is the account named ADMIN_ACCOUNT. "Staff" = the admin + every account with "moderator": true.
 // The moderator flag, bans, warnings and promotion requests all live on the account row, so they are saved with it.
 //
@@ -56,6 +58,8 @@ const FILTER_LIMIT = 5;                // blocked chat words within FILTER_WINDO
 const FILTER_WINDOW = 60 * 1000;
 const FILTER_MAX_REPORT = 20;          // most words one report can add (a message is at most 100 characters)
 const FILTER_WARNING = "You used too many words that the chat filter blocks. Please keep the chat friendly.";
+const MAX_REPORT_INBOX = 50;           // reports kept per staff account until their game collects them (oldest dropped)
+const MAX_REPORTS_PER_HOUR = 10;       // reports one account may send per hour
 const MAX_MOD_REQUESTS = 10;           // pending "make X a moderator" requests kept per target
 
 // ---------- storage ----------
@@ -409,9 +413,6 @@ function moderate(res, msg, json) {
   if (action === "warn") {
     if (!reason) return json(res, 400, { error: "Give a reason for the warning." });
     target.warnings = [...(target.warnings || []), { by, reason, at: now, seen: false }].slice(-MAX_WARNINGS);
-  } else if (action === "unwarn") {
-    if (!(target.warnings || []).length) return json(res, 409, { error: "That account has no warnings." });
-    target.warnings = target.warnings.slice(0, -1);   // removes the newest one (call again for the next)
   } else if (action === "tempban") {
     const minutes = Math.floor(Number(msg.minutes));
     if (!(minutes >= 1)) return json(res, 400, { error: "Give the ban length in minutes." });
@@ -454,6 +455,29 @@ function filtered(res, msg, json) {
     filterHits.set(auth.key, hits);
   }
   return json(res, 200, { ok: true, warned });
+}
+
+// Any logged-in account can report a player. The report is copied into the inbox of the admin and of every moderator
+// (except the reporter), and each of them gets it once through /account/notices.
+function report(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  const reason = str(msg.reason).trim().slice(0, MAX_REASON);
+  const target = str(msg.target).trim().slice(0, 30);
+  const account = str(msg.account).trim().slice(0, 30);
+  if (!reason) return json(res, 400, { error: "Please write a reason." });
+  if (!target) return json(res, 400, { error: "Bad request." });
+  if (account && account.toLowerCase() === auth.key) return json(res, 400, { error: "You can't report yourself." });
+  if (tooMany("report:" + auth.key, MAX_REPORTS_PER_HOUR, 60 * 60 * 1000)) return json(res, 429, { error: "You have sent too many reports. Try again later." });
+  bump("report:" + auth.key, 60 * 60 * 1000);
+  const entry = { from: db.users[auth.key].name, target, account, reason, at: Date.now() };
+  for (const [key, user] of Object.entries(db.users)) {
+    if (key === auth.key || !isStaff(key)) continue;
+    user.reports = [...(user.reports || []), entry].slice(-MAX_REPORT_INBOX);
+  }
+  persist();
+  console.log(`report: ${entry.from} -> ${target}${account ? " (" + account + ")" : ""}: ${reason}`);
+  return json(res, 200, { ok: true });
 }
 
 // Moderators can't promote anyone themselves: this leaves a request for the admin ("this person wants to make this person a moderator")
@@ -499,6 +523,11 @@ function notices(res, msg, json) {
     persist();
   }
   const out = { ok: true, warnings: fresh.map((w) => ({ by: w.by, reason: w.reason, at: w.at })) };
+  if (isStaff(auth.key) && (auth.user.reports || []).length) {   // player reports: each one is handed out once
+    out.reports = auth.user.reports;
+    delete auth.user.reports;
+    persist();
+  }
   if (isAdmin(auth.key)) {
     out.mod_requests = [];
     for (const user of Object.values(db.users)) {
@@ -546,6 +575,7 @@ async function handle(req, res, url, json) {
       case "/account/dismiss_request": return dismissRequest(res, msg, json);
       case "/account/notices": return notices(res, msg, json);
       case "/account/filtered": return filtered(res, msg, json);
+      case "/account/report": return report(res, msg, json);
       default: return json(res, 404, { error: "Not found." });
     }
   } catch (e) {
