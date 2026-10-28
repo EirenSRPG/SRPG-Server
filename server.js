@@ -15,9 +15,10 @@
 //   client -> server: {t:"hall", token, name}     enter the general lobby (the fullest hall with room, or a new one when all are full)
 //                     {t:"hmove", x, y}           my position
 //                     {t:"hemote", e}             an emote (0-7)
+//                     {t:"hchat", text, account}    say something to the hall (passed on to everybody else)
 //                     {t:"hleave"}                leave the hall
 //   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c}]}
-//                     {t:"hall_peer", id, name, x, y, c} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e}
+//                     {t:"hall_peer", id, name, x, y, c} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e} / {t:"hc", id, name, account, text}
 //
 // Binary messages are game packets: int32 LE (target when sending / sender when receiving), mode byte, channel byte, payload.
 //   guest -> host only (the host's Godot relays guest-to-guest messages)
@@ -250,6 +251,13 @@ function onHallMessage(ws, msg) {
     if (!(e >= 0 && e < HALL_EMOTES)) return;
     ws.hEmoteAt = now;
     hallSend(hall, { t: "he", id: ws.hallId, e });
+  } else if (msg.t === "hchat") {
+    if (now - (ws.hChatAt || 0) < 400) return;   // slow down
+    const text = typeof msg.text === "string" ? msg.text.replace(/[\x00-\x1F\x7F]/g, " ").trim().slice(0, 100) : "";
+    if (!text) return;
+    ws.hChatAt = now;
+    const account = typeof msg.account === "string" ? msg.account.replace(/[^A-Za-z0-9_]/g, "").slice(0, 20) : "";
+    hallSend(hall, { t: "hc", id: ws.hallId, name: ws.hallName, account, text }, ws);   // (the sender already shows their own line)
   } else if (msg.t === "hleave") {
     leaveHall(ws);
   }
@@ -263,7 +271,7 @@ function onText(ws, text) {
     case "host": return gated(ws, msg, hostRoom);
     case "join": return gated(ws, msg, joinRoom);
     case "hall": return gated(ws, msg, joinHall);
-    case "hmove": case "hemote": case "hleave":
+    case "hmove": case "hemote": case "hchat": case "hleave":
       if (ws.hall) onHallMessage(ws, msg);
       return;
     case "refuse":
