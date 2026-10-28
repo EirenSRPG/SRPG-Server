@@ -18,7 +18,10 @@
 //   POST /account/report        {token, target, account, reason} -> {ok}    any logged-in account reports a player (target = character name,
 //                                account = their account name if the game knows it, else ""). Goes to the admin + every moderator.
 //   POST /account/notices        {token}                    -> {ok, warnings: [{by, reason, at}], mod_requests?: [{username, by, at}], reports?: [{from, target, account, reason, at}]}
-//                                warnings are handed out once; mod_requests only for the admin; reports (staff only) are handed out once per staff account
+//                                warnings are handed out once; mod_requests only for the admin; reports (staff only) pop up once per staff account
+//   POST /account/reports        {token}                    -> {ok, reports: [{id, from, target, account, reason, at}]}   staff only: every report from the
+//                                last 3 days, newest first (reports delete themselves after REPORT_TTL)
+//   POST /account/report_delete  {token, id}                -> {ok}                                 staff only: removes that report from your list
 // The admin is the account named ADMIN_ACCOUNT. "Staff" = the admin + every account with "moderator": true.
 // The moderator flag, bans, warnings and promotion requests all live on the account row, so they are saved with it.
 //
@@ -59,6 +62,7 @@ const FILTER_WINDOW = 60 * 1000;
 const FILTER_MAX_REPORT = 20;          // most words one report can add (a message is at most 100 characters)
 const FILTER_WARNING = "You used too many words that the chat filter blocks. Please keep the chat friendly.";
 const MAX_REPORT_INBOX = 50;           // reports kept per staff account until their game collects them (oldest dropped)
+const REPORT_TTL = 3 * 24 * 60 * 60 * 1000;   // reports are kept for 3 days, then delete themselves
 const MAX_REPORTS_PER_HOUR = 10;       // reports one account may send per hour
 const MAX_MOD_REQUESTS = 10;           // pending "make X a moderator" requests kept per target
 
@@ -457,8 +461,24 @@ function filtered(res, msg, json) {
   return json(res, 200, { ok: true, warned });
 }
 
-// Any logged-in account can report a player. The report is copied into the inbox of the admin and of every moderator
-// (except the reporter), and each of them gets it once through /account/notices.
+// Drops reports older than REPORT_TTL from every staff list (runs when reports are sent or read, and every hour)
+function pruneReports() {
+  const cutoff = Date.now() - REPORT_TTL;
+  let changed = false;
+  for (const user of Object.values(db.users)) {
+    if (!user.reports) continue;
+    const kept = user.reports.filter((r) => r.at > cutoff);
+    if (kept.length === user.reports.length) continue;
+    if (kept.length) user.reports = kept; else delete user.reports;
+    changed = true;
+  }
+  if (changed) persist();
+}
+setInterval(() => { if (ready) pruneReports(); }, 60 * 60 * 1000).unref();
+
+// Any logged-in account can report a player. The report is copied into the list of the admin and of every moderator
+// (except the reporter). Each of them gets a popup once through /account/notices (the copy's "seen" flag), and the copy stays
+// in their Reports screen (/account/reports) until they delete it or it is REPORT_TTL old.
 function report(res, msg, json) {
   const auth = userFromToken(msg.token);
   if (!auth) return json(res, 401, { error: "Please log in again." });
@@ -470,10 +490,11 @@ function report(res, msg, json) {
   if (account && account.toLowerCase() === auth.key) return json(res, 400, { error: "You can't report yourself." });
   if (tooMany("report:" + auth.key, MAX_REPORTS_PER_HOUR, 60 * 60 * 1000)) return json(res, 429, { error: "You have sent too many reports. Try again later." });
   bump("report:" + auth.key, 60 * 60 * 1000);
-  const entry = { from: db.users[auth.key].name, target, account, reason, at: Date.now() };
+  pruneReports();
+  const entry = { id: crypto.randomBytes(6).toString("hex"), from: db.users[auth.key].name, target, account, reason, at: Date.now() };
   for (const [key, user] of Object.entries(db.users)) {
     if (key === auth.key || !isStaff(key)) continue;
-    user.reports = [...(user.reports || []), entry].slice(-MAX_REPORT_INBOX);
+    user.reports = [...(user.reports || []), { ...entry, seen: false }].slice(-MAX_REPORT_INBOX);
   }
   persist();
   console.log(`report: ${entry.from} -> ${target}${account ? " (" + account + ")" : ""}: ${reason}`);
@@ -513,6 +534,36 @@ function dismissRequest(res, msg, json) {
   return json(res, 200, { ok: true });
 }
 
+// Staff only: the Reports screen. Everything from the last REPORT_TTL, newest first. Opening it counts as having seen them.
+function listReports(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (!isStaff(auth.key)) return json(res, 403, { error: "Not allowed." });
+  pruneReports();
+  const list = auth.user.reports || [];
+  if (list.some((r) => !r.seen)) {
+    for (const r of list) r.seen = true;
+    persist();
+  }
+  const out = list.map((r) => ({ id: r.id, from: r.from, target: r.target, account: r.account, reason: r.reason, at: r.at })).reverse();
+  return json(res, 200, { ok: true, reports: out });
+}
+
+// Staff only: remove one report from your own list
+function deleteReport(res, msg, json) {
+  const auth = userFromToken(msg.token);
+  if (!auth) return json(res, 401, { error: "Please log in again." });
+  if (!isStaff(auth.key)) return json(res, 403, { error: "Not allowed." });
+  const id = str(msg.id);
+  const before = (auth.user.reports || []).length;
+  const kept = (auth.user.reports || []).filter((r) => r.id !== id);
+  if (kept.length !== before) {
+    if (kept.length) auth.user.reports = kept; else delete auth.user.reports;
+    persist();
+  }
+  return json(res, 200, { ok: true });
+}
+
 // Polled by every game: new warnings for you (each one is returned once), and for the admin the open promotion requests
 function notices(res, msg, json) {
   const auth = userFromToken(msg.token);
@@ -523,10 +574,14 @@ function notices(res, msg, json) {
     persist();
   }
   const out = { ok: true, warnings: fresh.map((w) => ({ by: w.by, reason: w.reason, at: w.at })) };
-  if (isStaff(auth.key) && (auth.user.reports || []).length) {   // player reports: each one is handed out once
-    out.reports = auth.user.reports;
-    delete auth.user.reports;
-    persist();
+  pruneReports();
+  if (isStaff(auth.key)) {   // player reports: each one pops up once (it stays in the Reports list)
+    const unseen = (auth.user.reports || []).filter((r) => !r.seen);
+    if (unseen.length) {
+      for (const r of unseen) r.seen = true;
+      persist();
+      out.reports = unseen.map((r) => ({ from: r.from, target: r.target, account: r.account, reason: r.reason, at: r.at }));
+    }
   }
   if (isAdmin(auth.key)) {
     out.mod_requests = [];
@@ -576,6 +631,8 @@ async function handle(req, res, url, json) {
       case "/account/notices": return notices(res, msg, json);
       case "/account/filtered": return filtered(res, msg, json);
       case "/account/report": return report(res, msg, json);
+      case "/account/reports": return listReports(res, msg, json);
+      case "/account/report_delete": return deleteReport(res, msg, json);
       default: return json(res, 404, { error: "Not found." });
     }
   } catch (e) {
