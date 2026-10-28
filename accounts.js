@@ -484,7 +484,9 @@ function report(res, msg, json) {
   if (!auth) return json(res, 401, { error: "Please log in again." });
   const reason = str(msg.reason).trim().slice(0, MAX_REASON);
   const target = str(msg.target).trim().slice(0, 30);
-  const account = str(msg.account).trim().slice(0, 30);
+  let account = str(msg.account).trim().slice(0, 30);
+  const accountRow = db.users[account.toLowerCase()];
+  account = accountRow ? accountRow.name : "";   // only real accounts count, shown with their proper capitals
   if (!reason) return json(res, 400, { error: "Please write a reason." });
   if (!target) return json(res, 400, { error: "Bad request." });
   if (account && account.toLowerCase() === auth.key) return json(res, 400, { error: "You can't report yourself." });
