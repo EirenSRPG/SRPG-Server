@@ -127,8 +127,15 @@ function newCode() {
 async function gated(ws, msg, action) {
   if (ws.room || ws.hall || ws.gating) return;
   ws.gating = true;
-  const gate = await accounts.multiplayerGate(msg.token);
-  ws.gating = false;
+  let gate;
+  try {
+    gate = await accounts.multiplayerGate(msg.token);
+  } catch (e) {
+    console.log("multiplayerGate failed:", e && e.message);
+    gate = { ok: false, reason: "The lobby server couldn't check your account. Try again." };
+  } finally {
+    ws.gating = false;   // (without this a failed check left the player waiting for ever)
+  }
   if (ws.readyState !== 1) return;
   if (!gate.ok) return fail(ws, gate.reason);
   ws.accountKey = gate.key;
