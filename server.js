@@ -53,7 +53,8 @@ function json(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
-// HTTP side: health check, the public lobby list, and the host's public/private switch.
+// HTTP side: health check, the server's clock, the public lobby list, and the host's public/private switch.
+//   GET  /time           -> {unix}: the server's time in seconds since 1970 (UTC). Used by halloween.gd for the Halloween-only content.
 //   GET  /rooms          -> [{code, name, players, max}] for rooms that are public, open and not full
 //   POST /rooms/public   -> {code, token, on, name}. The first call for a room claims it with `token`
 //                           (the host does this as soon as the room exists); after that only the same token can change it.
@@ -65,6 +66,11 @@ const server = http.createServer((req, res) => {
   }
   if (url.startsWith("/account/")) {
     return accounts.handle(req, res, url, json);
+  }
+  if (req.method === "GET" && url === "/time") {
+    // The game asks for the date here (halloween.gd) so the Halloween-only content can't be unlocked by changing the computer's clock.
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store", ...CORS });
+    return res.end(JSON.stringify({ unix: Date.now() / 1000 }));
   }
   if (req.method === "GET" && url === "/rooms") {
     const list = [];
