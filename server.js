@@ -17,6 +17,11 @@
 //                     {t:"hemote", e}             an emote (0-7)
 //                     {t:"hchat", text, account}    say something to the hall (passed on to everybody else)
 //                     {t:"hleave"}                leave the hall
+//                     {t:"htrade_req", to}                 ask player `to` (a hall id) to trade
+//                     {t:"htrade_reply", to, accept}       answer a request that player `to` sent me
+//                     {t:"htrade_cancel", to}              withdraw my request to `to`
+//   server -> client: {t:"htrade_req", from, name} / {t:"htrade_reply", from, accept} / {t:"htrade_cancel", from}
+//                     {t:"htrade_start", with, name}       to BOTH players when a request is accepted
 //   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c,skin}]}
 //                     {t:"hall_peer", id, name, x, y, c, skin} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e} / {t:"hc", id, name, account, text}
 //
@@ -229,9 +234,54 @@ function joinHall(ws, msg) {
   hallSend(hall, { t: "hall_peer", ...hallInfo(ws) }, ws);
 }
 
+// ---- Player trade requests (hall only) ----
+// Each player has at most ONE outgoing request (ws.tradeOut = the target's hall id, 0 = none). A reply is only honoured if the
+// asker really has a request out to the replier, so nobody can fake an "accept". The trade window itself is a later step.
+const TRADE_REQUEST_MS = 35000;   // a little longer than the client's 30 s, so the client's own timeout cancels first
+
+function clearTradeOut(ws) {
+  if (ws.tradeTimer) clearTimeout(ws.tradeTimer);
+  ws.tradeTimer = null;
+  ws.tradeOut = 0;
+}
+
+function onTradeMessage(ws, msg) {
+  const hall = ws.hall;
+  const now = Date.now();
+  const to = parseInt(msg.to, 10);
+  const target = Number.isFinite(to) ? hall.members.get(to) : null;
+  if (!target || target === ws || target.readyState !== 1) return;
+  if (msg.t === "htrade_req") {
+    if (now - (ws.hTradeAt || 0) < 2000) return;   // slow down
+    ws.hTradeAt = now;
+    if (ws.tradeOut) {   // a new request replaces the old one (tell the old target it is gone)
+      const old = hall.members.get(ws.tradeOut);
+      if (old) send(old, { t: "htrade_cancel", from: ws.hallId });
+    }
+    clearTradeOut(ws);
+    ws.tradeOut = target.hallId;
+    ws.tradeTimer = setTimeout(() => clearTradeOut(ws), TRADE_REQUEST_MS);
+    send(target, { t: "htrade_req", from: ws.hallId, name: ws.hallName });
+  } else if (msg.t === "htrade_cancel") {
+    if (ws.tradeOut !== target.hallId) return;
+    clearTradeOut(ws);
+    send(target, { t: "htrade_cancel", from: ws.hallId });
+  } else if (msg.t === "htrade_reply") {
+    if (target.tradeOut !== ws.hallId) return;   // that player never asked me (or it expired / was cancelled)
+    clearTradeOut(target);
+    const accept = !!msg.accept;
+    send(target, { t: "htrade_reply", from: ws.hallId, accept });
+    if (accept) {
+      send(target, { t: "htrade_start", with: ws.hallId, name: ws.hallName });
+      send(ws, { t: "htrade_start", with: target.hallId, name: target.hallName });
+    }
+  }
+}
+
 function leaveHall(ws) {
   const hall = ws.hall;
   if (!hall) return;
+  clearTradeOut(ws);   // (anybody who asked ME just sees me leave: the client drops their popup on hall_peer_left)
   ws.hall = null;
   hall.members.delete(ws.hallId);
   if (hall.members.size === 0) {
@@ -281,6 +331,9 @@ function onText(ws, text) {
     case "hall": return gated(ws, msg, joinHall);
     case "hmove": case "hemote": case "hchat": case "hleave":
       if (ws.hall) onHallMessage(ws, msg);
+      return;
+    case "htrade_req": case "htrade_reply": case "htrade_cancel":
+      if (ws.hall) onTradeMessage(ws, msg);
       return;
     case "refuse":
       if (ws.role === "host") ws.room.refuse = !!msg.on;
