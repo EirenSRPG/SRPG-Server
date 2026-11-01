@@ -13,7 +13,9 @@
 //
 // General lobby (a hangout run by this server, nobody hosts it; it exists while somebody is inside):
 //   client -> server: {t:"hall", token, name, skin}     enter the general lobby (the fullest hall with room, or a new one when all are full)
-//                     {t:"hswing"}               I swung what I hold (everybody sees it as {t:"hs", id})
+//                     {t:"hswing", fx, fy}       I swung what I hold, facing (fx, fy) (everybody else gets {t:"hs", id, fx, fy})
+//                     {t:"hdrop", n, item, x, y, tx, ty}   I drop an item (everybody gets {t:"hd", id, item, x, y, tx, ty, by, n}, or I get {t:"hdn", n} if refused)
+//                     {t:"hpick", id}            I walk over a dropped item (everybody gets {t:"hx", id}, the first to ask gets {t:"hpick_ok", id, item})
 //                     {t:"hmove", x, y, h}        my position, and the id of the item in my hand ("" = none)
 //                     {t:"hemote", e}             an emote (0-7)
 //                     {t:"hchat", text, account}    say something to the hall (passed on to everybody else)
@@ -222,7 +224,7 @@ function joinHall(ws, msg) {
   if (!hall) {
     let number = 1;
     while (halls.has(number)) number++;   // a closed hall's number is reused
-    hall = { number, members: new Map(), nextId: 1 };
+    hall = { number, members: new Map(), nextId: 1, drops: new Map(), nextDrop: 1 };   // drops = items lying on the floor
     halls.set(number, hall);
     console.log(`Slime Hall ${toRoman(number)} opened (${halls.size} halls)`);
   }
@@ -236,7 +238,7 @@ function joinHall(ws, msg) {
   ws.hLast = 0;
   const players = [...hall.members.values()].map(hallInfo);
   hall.members.set(ws.hallId, ws);
-  send(ws, { t: "hall_joined", id: ws.hallId, hall: "Slime Hall " + toRoman(hall.number), max: HALL_MAX, x: Math.round(ws.hx), y: Math.round(ws.hy), players });
+  send(ws, { t: "hall_joined", id: ws.hallId, hall: "Slime Hall " + toRoman(hall.number), max: HALL_MAX, x: Math.round(ws.hx), y: Math.round(ws.hy), players, drops: [...hall.drops.values()] });
   hallSend(hall, { t: "hall_peer", ...hallInfo(ws) }, ws);
 }
 
@@ -259,6 +261,7 @@ function clearTradeOut(ws) {
 // (Items live in each player's own save, so the server cannot check ownership: see the notes in the reply.)
 const TRADE_MAX_ITEMS = 8;
 const ITEM_RE = /^[a-z0-9_]{1,40}$/;
+const HALL_MAX_DROPS = 120;   // items on the floor of one hall
 
 function dropOutgoing(w) {
   if (w.tradeOut && w.hall) {
@@ -402,7 +405,31 @@ function onHallMessage(ws, msg) {
   } else if (msg.t === "hswing") {
     if (now - (ws.hSwingAt || 0) < 150) return;   // slow down
     ws.hSwingAt = now;
-    hallSend(hall, { t: "hs", id: ws.hallId }, ws);   // (the sender already shows their own swing)
+    const sign = (v) => Math.max(-1, Math.min(1, Math.round(Number(v)) || 0));   // which way they face: -1, 0 or 1
+    hallSend(hall, { t: "hs", id: ws.hallId, fx: sign(msg.fx), fy: sign(msg.fy) }, ws);   // (the sender already shows their own swing)
+  } else if (msg.t === "hdrop") {
+    // An item dropped on the floor. The server only keeps the list and decides who picks an item up; like trades, it cannot check
+    // that the player really owned the item (items live in each player's own save).
+    const n = parseInt(msg.n, 10) || 0;
+    const item = (typeof msg.item === "string" && ITEM_RE.test(msg.item)) ? msg.item : "";
+    const x = Number(msg.x), y = Number(msg.y), tx = Number(msg.tx), ty = Number(msg.ty);
+    if (!item || ![x, y, tx, ty].every(Number.isFinite) || now - (ws.hDropAt || 0) < 250 || hall.drops.size >= HALL_MAX_DROPS) {
+      send(ws, { t: "hdn", n });   // refused: the client gives the item back
+      return;
+    }
+    ws.hDropAt = now;
+    const clamp = (v, hi) => Math.round(Math.min(Math.max(v, 0), hi));
+    const drop = { id: hall.nextDrop++, item, x: clamp(tx, HALL_W), y: clamp(ty, HALL_H) };
+    hall.drops.set(drop.id, drop);
+    hallSend(hall, { t: "hd", id: drop.id, item, x: clamp(x, HALL_W), y: clamp(y, HALL_H), tx: drop.x, ty: drop.y, by: ws.hallId, n });
+  } else if (msg.t === "hpick") {
+    const id = parseInt(msg.id, 10);
+    const drop = hall.drops.get(id);
+    if (!drop) return;   // somebody was faster
+    if (Math.hypot(drop.x - ws.hx, drop.y - ws.hy) > 80) return;   // too far away to reach it
+    hall.drops.delete(id);   // the first to ask gets it
+    hallSend(hall, { t: "hx", id, by: ws.hallId });
+    send(ws, { t: "hpick_ok", id, item: drop.item });
   } else if (msg.t === "hleave") {
     leaveHall(ws);
   }
@@ -416,7 +443,7 @@ function onText(ws, text) {
     case "host": return gated(ws, msg, hostRoom);
     case "join": return gated(ws, msg, joinRoom);
     case "hall": return gated(ws, msg, joinHall);
-    case "hmove": case "hemote": case "hchat": case "hswing": case "hleave":
+    case "hmove": case "hemote": case "hchat": case "hswing": case "hdrop": case "hpick": case "hleave":
       if (ws.hall) onHallMessage(ws, msg);
       return;
     case "htrade_req": case "htrade_reply": case "htrade_cancel": case "htrade_offer": case "htrade_accept": case "htrade_end":
