@@ -13,6 +13,7 @@
 //
 // General lobby (a hangout run by this server, nobody hosts it; it exists while somebody is inside):
 //   client -> server: {t:"hall", token, name, skin}     enter the general lobby (the fullest hall with room, or a new one when all are full)
+//                     {t:"hswing"}               I swung what I hold (everybody sees it as {t:"hs", id})
 //                     {t:"hmove", x, y, h}        my position, and the id of the item in my hand ("" = none)
 //                     {t:"hemote", e}             an emote (0-7)
 //                     {t:"hchat", text, account}    say something to the hall (passed on to everybody else)
@@ -398,6 +399,10 @@ function onHallMessage(ws, msg) {
     ws.hChatAt = now;
     const account = typeof msg.account === "string" ? msg.account.replace(/[^A-Za-z0-9_]/g, "").slice(0, 20) : "";
     hallSend(hall, { t: "hc", id: ws.hallId, name: ws.hallName, account, text }, ws);   // (the sender already shows their own line)
+  } else if (msg.t === "hswing") {
+    if (now - (ws.hSwingAt || 0) < 150) return;   // slow down
+    ws.hSwingAt = now;
+    hallSend(hall, { t: "hs", id: ws.hallId }, ws);   // (the sender already shows their own swing)
   } else if (msg.t === "hleave") {
     leaveHall(ws);
   }
@@ -411,7 +416,7 @@ function onText(ws, text) {
     case "host": return gated(ws, msg, hostRoom);
     case "join": return gated(ws, msg, joinRoom);
     case "hall": return gated(ws, msg, joinHall);
-    case "hmove": case "hemote": case "hchat": case "hleave":
+    case "hmove": case "hemote": case "hchat": case "hswing": case "hleave":
       if (ws.hall) onHallMessage(ws, msg);
       return;
     case "htrade_req": case "htrade_reply": case "htrade_cancel": case "htrade_offer": case "htrade_accept": case "htrade_end":
