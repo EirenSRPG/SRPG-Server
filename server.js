@@ -213,7 +213,7 @@ function joinHall(ws, msg) {
     while (halls.has(number)) number++;   // a closed hall's number is reused
     hall = { number, members: new Map(), nextId: 1 };
     halls.set(number, hall);
-    console.log(`Great Hall ${toRoman(number)} opened (${halls.size} halls)`);
+    console.log(`Slime Hall ${toRoman(number)} opened (${halls.size} halls)`);
   }
   ws.hall = hall;
   ws.hallId = hall.nextId++;
@@ -223,7 +223,7 @@ function joinHall(ws, msg) {
   ws.hLast = 0;
   const players = [...hall.members.values()].map(hallInfo);
   hall.members.set(ws.hallId, ws);
-  send(ws, { t: "hall_joined", id: ws.hallId, hall: "Great Hall " + toRoman(hall.number), max: HALL_MAX, x: Math.round(ws.hx), y: Math.round(ws.hy), players });
+  send(ws, { t: "hall_joined", id: ws.hallId, hall: "Slime Hall " + toRoman(hall.number), max: HALL_MAX, x: Math.round(ws.hx), y: Math.round(ws.hy), players });
   hallSend(hall, { t: "hall_peer", ...hallInfo(ws) }, ws);
 }
 
@@ -234,7 +234,7 @@ function leaveHall(ws) {
   hall.members.delete(ws.hallId);
   if (hall.members.size === 0) {
     halls.delete(hall.number);
-    console.log(`Great Hall ${toRoman(hall.number)} closed (${halls.size} halls)`);
+    console.log(`Slime Hall ${toRoman(hall.number)} closed (${halls.size} halls)`);
   } else {
     hallSend(hall, { t: "hall_peer_left", id: ws.hallId });
   }
