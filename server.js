@@ -20,6 +20,11 @@
 //                     {t:"htrade_req", to}                 ask player `to` (a hall id) to trade
 //                     {t:"htrade_reply", to, accept}       answer a request that player `to` sent me
 //                     {t:"htrade_cancel", to}              withdraw my request to `to`
+//                     {t:"htrade_offer", items:[ids]}      (in a trade) my offer; clears both accepts
+//                     {t:"htrade_accept", on, seen}        (in a trade) accept / un-accept; `seen` = the version of THEIR offer I have seen
+//                     {t:"htrade_end"}                     (in a trade) cancel the trade
+//   server -> client: {t:"htrade_offer", from, items, ver} / {t:"htrade_accepted", from, on} / {t:"htrade_ended", from, reason}
+//                     {t:"htrade_done", give:[ids], get:[ids]} / {t:"htrade_busy", from}
 //   server -> client: {t:"htrade_req", from, name} / {t:"htrade_reply", from, accept} / {t:"htrade_cancel", from}
 //                     {t:"htrade_start", with, name}       to BOTH players when a request is accepted
 //   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c,skin}]}
@@ -245,13 +250,89 @@ function clearTradeOut(ws) {
   ws.tradeOut = 0;
 }
 
+// ---- The trade itself (after a request was accepted) ----
+// Both players are paired through ws.tradeWith. Each has an offer (a list of item ids, up to TRADE_MAX_ITEMS), a version number
+// that goes up with every change, and an accepted flag. Changing an offer clears BOTH accepted flags, and an accept only counts if
+// it names the version of the other player's offer that the accepting player has actually seen. When both have accepted, the server
+// sends each side exactly what it gives and gets (from the offers it recorded), so a client cannot claim a different trade.
+// (Items live in each player's own save, so the server cannot check ownership: see the notes in the reply.)
+const TRADE_MAX_ITEMS = 8;
+const ITEM_RE = /^[a-z0-9_]{1,40}$/;
+
+function dropOutgoing(w) {
+  if (w.tradeOut && w.hall) {
+    const old = w.hall.members.get(w.tradeOut);
+    if (old) send(old, { t: "htrade_cancel", from: w.hallId });
+  }
+  clearTradeOut(w);
+}
+
+function resetTrade(w) {
+  w.tradeWith = null;
+  w.tradeOffer = [];
+  w.tradeAccepted = false;
+  w.tradeVer = 0;
+}
+
+function startTrade(replier, asker) {
+  for (const w of [replier, asker]) {
+    dropOutgoing(w);
+    resetTrade(w);
+  }
+  replier.tradeWith = asker;
+  asker.tradeWith = replier;
+  send(asker, { t: "htrade_start", with: replier.hallId, name: replier.hallName });
+  send(replier, { t: "htrade_start", with: asker.hallId, name: asker.hallName });
+}
+
+function endTrade(ws, reason) {
+  const other = ws.tradeWith;
+  if (!other) return;
+  resetTrade(ws);
+  resetTrade(other);
+  send(other, { t: "htrade_ended", from: ws.hallId, reason });
+}
+
+function onTradeSession(ws, msg) {
+  const other = ws.tradeWith;
+  if (!other || other.readyState !== 1 || other.tradeWith !== ws) return;
+  const now = Date.now();
+  if (msg.t === "htrade_end") {
+    endTrade(ws, "cancelled");
+  } else if (msg.t === "htrade_offer") {
+    if (now - (ws.hTradeOfferAt || 0) < 100) return;
+    ws.hTradeOfferAt = now;
+    const items = Array.isArray(msg.items) ? msg.items.filter((s) => typeof s === "string" && ITEM_RE.test(s)).slice(0, TRADE_MAX_ITEMS) : [];
+    ws.tradeOffer = items;
+    ws.tradeVer++;
+    ws.tradeAccepted = false;
+    other.tradeAccepted = false;
+    send(other, { t: "htrade_offer", from: ws.hallId, items, ver: ws.tradeVer });
+  } else if (msg.t === "htrade_accept") {
+    const on = !!msg.on;
+    if (on && parseInt(msg.seen, 10) !== other.tradeVer) return;   // they have not seen the latest offer yet
+    ws.tradeAccepted = on;
+    send(other, { t: "htrade_accepted", from: ws.hallId, on });
+    if (ws.tradeAccepted && other.tradeAccepted) {
+      const mine = ws.tradeOffer, theirs = other.tradeOffer;
+      resetTrade(ws);
+      resetTrade(other);
+      send(ws, { t: "htrade_done", give: mine, get: theirs });
+      send(other, { t: "htrade_done", give: theirs, get: mine });
+    }
+  }
+}
+
 function onTradeMessage(ws, msg) {
+  if (msg.t === "htrade_offer" || msg.t === "htrade_accept" || msg.t === "htrade_end") return onTradeSession(ws, msg);
   const hall = ws.hall;
   const now = Date.now();
   const to = parseInt(msg.to, 10);
   const target = Number.isFinite(to) ? hall.members.get(to) : null;
   if (!target || target === ws || target.readyState !== 1) return;
   if (msg.t === "htrade_req") {
+    if (ws.tradeWith) return;   // already trading
+    if (target.tradeWith) { send(ws, { t: "htrade_busy", from: target.hallId }); return; }
     if (now - (ws.hTradeAt || 0) < 2000) return;   // slow down
     ws.hTradeAt = now;
     if (ws.tradeOut) {   // a new request replaces the old one (tell the old target it is gone)
@@ -269,18 +350,17 @@ function onTradeMessage(ws, msg) {
   } else if (msg.t === "htrade_reply") {
     if (target.tradeOut !== ws.hallId) return;   // that player never asked me (or it expired / was cancelled)
     clearTradeOut(target);
-    const accept = !!msg.accept;
+    let accept = !!msg.accept;
+    if (accept && (ws.tradeWith || target.tradeWith)) accept = false;   // somebody is already in a trade
     send(target, { t: "htrade_reply", from: ws.hallId, accept });
-    if (accept) {
-      send(target, { t: "htrade_start", with: ws.hallId, name: ws.hallName });
-      send(ws, { t: "htrade_start", with: target.hallId, name: target.hallName });
-    }
+    if (accept) startTrade(ws, target);
   }
 }
 
 function leaveHall(ws) {
   const hall = ws.hall;
   if (!hall) return;
+  endTrade(ws, "left");   // an open trade ends: the other player is told
   clearTradeOut(ws);   // (anybody who asked ME just sees me leave: the client drops their popup on hall_peer_left)
   ws.hall = null;
   hall.members.delete(ws.hallId);
@@ -332,7 +412,7 @@ function onText(ws, text) {
     case "hmove": case "hemote": case "hchat": case "hleave":
       if (ws.hall) onHallMessage(ws, msg);
       return;
-    case "htrade_req": case "htrade_reply": case "htrade_cancel":
+    case "htrade_req": case "htrade_reply": case "htrade_cancel": case "htrade_offer": case "htrade_accept": case "htrade_end":
       if (ws.hall) onTradeMessage(ws, msg);
       return;
     case "refuse":
