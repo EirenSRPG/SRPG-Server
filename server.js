@@ -13,7 +13,7 @@
 //
 // General lobby (a hangout run by this server, nobody hosts it; it exists while somebody is inside):
 //   client -> server: {t:"hall", token, name, skin}     enter the general lobby (the fullest hall with room, or a new one when all are full)
-//                     {t:"hmove", x, y}           my position
+//                     {t:"hmove", x, y, h}        my position, and the id of the item in my hand ("" = none)
 //                     {t:"hemote", e}             an emote (0-7)
 //                     {t:"hchat", text, account}    say something to the hall (passed on to everybody else)
 //                     {t:"hleave"}                leave the hall
@@ -28,7 +28,7 @@
 //   server -> client: {t:"htrade_req", from, name} / {t:"htrade_reply", from, accept} / {t:"htrade_cancel", from}
 //                     {t:"htrade_start", with, name}       to BOTH players when a request is accepted
 //   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c,skin}]}
-//                     {t:"hall_peer", id, name, x, y, c, skin} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e} / {t:"hc", id, name, account, text}
+//                     {t:"hall_peer", id, name, x, y, c, skin} / {t:"hall_peer_left", id} / {t:"hm", id, x, y, h} / {t:"he", id, e} / {t:"hc", id, name, account, text}
 //
 // Binary messages are game packets: int32 LE (target when sending / sender when receiving), mode byte, channel byte, payload.
 //   guest -> host only (the host's Godot relays guest-to-guest messages)
@@ -207,7 +207,7 @@ function hallSend(hall, obj, except) {
 }
 
 function hallInfo(ws) {
-  return { id: ws.hallId, name: ws.hallName, x: Math.round(ws.hx), y: Math.round(ws.hy), c: ws.hallId % 8, skin: ws.hallSkin || "default" };
+  return { id: ws.hallId, name: ws.hallName, x: Math.round(ws.hx), y: Math.round(ws.hy), c: ws.hallId % 8, skin: ws.hallSkin || "default", h: ws.hallHeld || "" };
 }
 
 // The fullest hall that has room, so people gather together; a new hall only when every hall is full. Halls vanish when empty.
@@ -382,7 +382,9 @@ function onHallMessage(ws, msg) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
     ws.hx = Math.min(Math.max(x, 0), HALL_W);
     ws.hy = Math.min(Math.max(y, 0), HALL_H);
-    hallSend(hall, { t: "hm", id: ws.hallId, x: Math.round(ws.hx), y: Math.round(ws.hy) }, ws);
+    // the item id in the player's hand (a short word like "claymore"; "" = nothing). Clients ignore ids they do not know.
+    ws.hallHeld = (typeof msg.h === "string" && /^[a-z0-9_]{1,40}$/.test(msg.h)) ? msg.h : "";
+    hallSend(hall, { t: "hm", id: ws.hallId, x: Math.round(ws.hx), y: Math.round(ws.hy), h: ws.hallHeld }, ws);
   } else if (msg.t === "hemote") {
     if (now - (ws.hEmoteAt || 0) < 800) return;
     const e = parseInt(msg.e, 10);
