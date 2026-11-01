@@ -12,13 +12,13 @@
 //                     {t:"error", reason}       then the socket is closed
 //
 // General lobby (a hangout run by this server, nobody hosts it; it exists while somebody is inside):
-//   client -> server: {t:"hall", token, name}     enter the general lobby (the fullest hall with room, or a new one when all are full)
+//   client -> server: {t:"hall", token, name, skin}     enter the general lobby (the fullest hall with room, or a new one when all are full)
 //                     {t:"hmove", x, y}           my position
 //                     {t:"hemote", e}             an emote (0-7)
 //                     {t:"hchat", text, account}    say something to the hall (passed on to everybody else)
 //                     {t:"hleave"}                leave the hall
-//   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c}]}
-//                     {t:"hall_peer", id, name, x, y, c} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e} / {t:"hc", id, name, account, text}
+//   server -> client: {t:"hall_joined", id, hall, max, players:[{id,name,x,y,c,skin}]}
+//                     {t:"hall_peer", id, name, x, y, c, skin} / {t:"hall_peer_left", id} / {t:"hm", id, x, y} / {t:"he", id, e} / {t:"hc", id, name, account, text}
 //
 // Binary messages are game packets: int32 LE (target when sending / sender when receiving), mode byte, channel byte, payload.
 //   guest -> host only (the host's Godot relays guest-to-guest messages)
@@ -197,7 +197,7 @@ function hallSend(hall, obj, except) {
 }
 
 function hallInfo(ws) {
-  return { id: ws.hallId, name: ws.hallName, x: Math.round(ws.hx), y: Math.round(ws.hy), c: ws.hallId % 8 };
+  return { id: ws.hallId, name: ws.hallName, x: Math.round(ws.hx), y: Math.round(ws.hy), c: ws.hallId % 8, skin: ws.hallSkin || "default" };
 }
 
 // The fullest hall that has room, so people gather together; a new hall only when every hall is full. Halls vanish when empty.
@@ -218,6 +218,8 @@ function joinHall(ws, msg) {
   ws.hall = hall;
   ws.hallId = hall.nextId++;
   ws.hallName = (typeof msg.name === "string" ? msg.name.replace(/[^\x20-\x7E]/g, "").trim().slice(0, 14) : "") || "Traveller";
+  // The Vanities skin id the player wears (just a short word like "crown"; the game shows the green slime for one it does not know)
+  ws.hallSkin = (typeof msg.skin === "string" && /^[a-z0-9_]{1,24}$/.test(msg.skin)) ? msg.skin : "default";
   ws.hx = HALL_W / 2 + (Math.random() - 0.5) * 80;
   ws.hy = HALL_H - 60 + (Math.random() - 0.5) * 20;
   ws.hLast = 0;
